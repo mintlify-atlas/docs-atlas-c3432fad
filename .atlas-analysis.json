@@ -1,0 +1,130 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "SeF",
+  "projectDescription": "A Rust implementation of the Secure Fountain architecture for slashing blockchain storage costs using Luby Transform fountain codes",
+  "theme": "aspen",
+  "primaryColor": "#b21e1e",
+  "lightColor": "#e59f82",
+  "darkColor": "#e0dbd9",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/architecture",
+              "concepts/fountain-codes",
+              "concepts/robust-soliton",
+              "concepts/epochs",
+              "concepts/peeling-decoder"
+            ]
+          },
+          {
+            "group": "Examples",
+            "pages": [
+              "examples/encode-decode",
+              "examples/bitcoin-integration",
+              "examples/custom-distribution"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "advanced/feature-flags",
+              "advanced/performance",
+              "advanced/troubleshooting"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core Modules",
+            "pages": [
+              "api/droplet",
+              "api/encoder",
+              "api/decoder",
+              "api/distribution"
+            ]
+          },
+          {
+            "group": "Blockchain Integration",
+            "pages": [
+              "api/chain",
+              "api/epoch",
+              "api/symbol"
+            ]
+          },
+          {
+            "group": "Utilities",
+            "pages": [
+              "api/encode",
+              "api/xor",
+              "api/experiment"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "CLI Reference",
+        "groups": [
+          {
+            "group": "Commands",
+            "pages": [
+              "cli/overview",
+              "cli/generate",
+              "cli/decode",
+              "cli/reconstruct",
+              "cli/chain-info",
+              "cli/dist-info",
+              "cli/experiment"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Luby Transform (LT) fountain codes implementation",
+    "Robust Soliton Distribution for optimal degree sampling",
+    "Error-resilient peeling decoder with authenticated verification",
+    "Bitcoin blockchain integration via blk*.dat and bitcoinkernel",
+    "Epoch-based encoding for scalable storage reduction",
+    "Storage reduction experiments and simulations",
+    "CLI tool for encode/decode operations",
+    "Symbol normalization for variable-length blocks"
+  ],
+  "publicApiSurface": [
+    "droplet::Droplet - Fountain-coded droplet structure",
+    "droplet::Encoder - LT code encoder",
+    "droplet::EpochParams - Epoch configuration parameters",
+    "distribution::RobustSoliton - Robust Soliton Distribution",
+    "distribution::DegreeDistribution - Degree distribution trait",
+    "decoder::peeling_decode - Full payload recovery decoder",
+    "decoder::peeling_check - Graph-only decoding simulation",
+    "decoder::BlockVerifier - Pluggable block verification trait",
+    "chain::BlkFileReader - Raw blk*.dat file reader",
+    "chain::KernelBlockReader - bitcoinkernel-backed reader",
+    "epoch::EpochConfig - User-facing epoch configuration",
+    "epoch::compute_epoch_seed - Deterministic seed derivation",
+    "epoch::auto_scale_droplets - Droplet count heuristics",
+    "symbol::blocks_to_symbols - Block normalization",
+    "symbol::symbols_to_blocks - Symbol reconstruction",
+    "encode::write_droplet - Droplet serialization",
+    "encode::read_droplet - Droplet deserialization",
+    "xor::xor_blocks - Multi-block XOR operation",
+    "experiment::storage_reduction_experiment - Simulation runner"
+  ]
+}
