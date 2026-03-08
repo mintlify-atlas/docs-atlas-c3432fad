@@ -1,0 +1,206 @@
+---
+title: sef generate
+description: Generate fountain-coded droplets from blockchain data
+---
+
+## Synopsis
+
+```bash
+sef generate --blocks-dir <PATH> [OPTIONS]
+```
+
+## Description
+
+Reads blocks from a Bitcoin data directory, partitions them into epochs, and generates fountain-coded droplets for each epoch using the Robust Soliton Distribution.
+
+The command:
+1. Streams blocks from the specified directory
+2. Groups them into epochs of size `k`
+3. Optionally normalizes blocks into fixed-size symbols
+4. Generates `n` droplets per epoch (or auto-scales to 2x the symbol count)
+5. Writes droplets and metadata to the output directory
+
+## Required Arguments
+
+<ParamField path="blocks-dir" type="path" required>
+  Path to Bitcoin blocks directory.
+  
+  - With `kernel` feature: Path to datadir parent (e.g., `~/.bitcoin/signet`)
+  - Without `kernel` feature: Path to blocks directory containing `blk*.dat` files
+  
+  **Example:** `~/.bitcoin/signet/blocks` or `~/.bitcoin/signet`
+</ParamField>
+
+## Options
+
+<ParamField path="output" type="path" default="droplets">
+  Output directory for droplet files. The command creates subdirectories `epoch_N/` for each epoch.
+  
+  **Short flag:** `-o`
+</ParamField>
+
+<ParamField path="k" type="integer" default="100">
+  Epoch size — number of blocks per epoch.
+  
+  Larger values provide better compression but require more droplets for recovery. Typical range: 50–10000.
+  
+  **Short flag:** `-k`
+</ParamField>
+
+<ParamField path="n" type="integer" default="0">
+  Number of droplets to generate per epoch.
+  
+  - `0` (default): Auto-scale to 2× the symbol count
+  - Explicit value: Generate exactly `n` droplets
+  
+  **Short flag:** `-n`
+  
+  <Tip>
+    The auto-scaling heuristic `n = 2k` provides good recovery probability for most use cases. Increase manually if you need higher reliability.
+  </Tip>
+</ParamField>
+
+<ParamField path="buffer" type="integer" default="10">
+  Number of recent blocks to keep raw (not encode).
+  
+  These blocks are excluded from encoding to maintain a confirmation window. Useful for preserving recent, potentially-reorganizable blocks.
+</ParamField>
+
+<ParamField path="c" type="float" default="0.1">
+  Robust Soliton parameter c — tuning constant.
+  
+  Controls the degree-1 spike in the distribution. Lower values increase the spike, higher values flatten it. Typical range: 0.01–0.5.
+  
+  **Short flag:** `-c`
+</ParamField>
+
+<ParamField path="delta" type="float" default="0.05">
+  Robust Soliton parameter delta — failure probability.
+  
+  Target probability that decoding will fail. Lower values increase overhead but improve reliability. Typical range: 0.01–0.1.
+</ParamField>
+
+<ParamField path="symbol-size" type="integer" default="4096">
+  Symbol size in bytes for block concatenation.
+  
+  - `0`: Disabled — encode blocks directly without normalization
+  - `> 0`: Concatenate blocks and split into fixed-size symbols before encoding
+  
+  Symbol normalization provides better XOR uniformity for variable-sized Bitcoin blocks.
+</ParamField>
+
+## Examples
+
+### Basic Usage
+
+<CodeGroup>
+
+```bash Default parameters
+sef generate --blocks-dir ~/.bitcoin/signet/blocks
+```
+
+```bash Custom epoch size and output
+sef generate \
+  --blocks-dir ~/.bitcoin/signet/blocks \
+  --output droplets/ \
+  --k 100 \
+  --symbol-size 4096
+```
+
+```bash High reliability configuration
+sef generate \
+  --blocks-dir ~/.bitcoin/signet/blocks \
+  --output droplets/ \
+  --k 100 \
+  --c 0.05 \
+  --delta 0.01 \
+  --n 250
+```
+
+```bash Disable symbol normalization
+sef generate \
+  --blocks-dir ~/.bitcoin/signet/blocks \
+  --k 50 \
+  --symbol-size 0
+```
+
+</CodeGroup>
+
+### Example Output
+
+```
+Streaming blocks from: /home/user/.bitcoin/signet/blocks
+  Symbol normalization: symbol_size=4096 bytes
+  Epoch   0: 100 blocks, 100 symbols, 200 droplets, source=45.2KB, droplets=90.4KB, E[deg]=3.5 (0.23s)
+  Epoch   1: 100 blocks, 100 symbols, 200 droplets, source=46.1KB, droplets=92.2KB, E[deg]=3.5 (0.22s)
+  Epoch   2: 100 blocks, 100 symbols, 200 droplets, source=44.8KB, droplets=89.6KB, E[deg]=3.5 (0.21s)
+
+=== Generation Summary ===
+  Total droplets:     600
+  Source data:        0.14 MB
+  Droplet data:       0.27 MB
+  Ratio (droplet/source): 2.00x
+  Total time:         0.71s
+  Output directory:   /home/user/droplets
+```
+
+## Output Structure
+
+The command creates the following directory structure:
+
+```
+<output>/
+├── epoch_0/
+│   ├── droplet_0.bin       # Droplet 0
+│   ├── droplet_1.bin       # Droplet 1
+│   ├── ...
+│   └── manifest.bin        # Symbol metadata (when symbol_size > 0)
+├── epoch_1/
+│   ├── droplet_0.bin
+│   └── ...
+```
+
+### Manifest File
+
+When symbol normalization is enabled (`--symbol-size > 0`), each epoch contains a `manifest.bin` file with:
+- Total number of symbols
+- Symbol size
+- Symbol hashes (for verification)
+- Block boundary information (for reassembly)
+
+This metadata is required by the [`decode`](/cli/decode) command to reconstruct the original blocks.
+
+## Performance Considerations
+
+<Note>
+  **Expected degree:** The Robust Soliton Distribution produces an expected degree of approximately `ln(k/delta) × √k`. For `k=100`, this is typically 3–5.
+  
+  Higher degrees increase encoding/decoding cost but reduce the number of droplets needed for recovery.
+</Note>
+
+### Encoding Throughput
+
+Typical throughput on modern hardware:
+- **With symbol normalization:** 50–200 MB/s
+- **Without symbol normalization:** 100–300 MB/s
+
+Throughput depends on:
+- Symbol/block sizes
+- Expected degree
+- CPU cache locality
+
+### Storage Overhead
+
+With default parameters (`n=0` auto-scaling to `2k`):
+- **Droplet data:** ~2× source data size
+- **Manifest overhead:** &lt;1% of total size
+
+<Tip>
+  To reduce storage, decrease `n` (e.g., `--n 150` for `k=100`), but this increases the risk of decoding failure.
+</Tip>
+
+## See Also
+
+- [`sef decode`](/cli/decode) — Decode droplets back to blocks
+- [`sef reconstruct`](/cli/reconstruct) — Test end-to-end encoding and decoding
+- [`sef dist-info`](/cli/dist-info) — View distribution statistics

@@ -1,0 +1,277 @@
+---
+title: 'Distribution'
+description: 'Degree distributions for LT fountain codes'
+---
+
+## Overview
+
+This module defines the `DegreeDistribution` trait and provides the canonical `RobustSoliton` implementation — the probability distribution at the heart of Luby Transform codes.
+
+The Robust Soliton Distribution (RSD) augments the Ideal Soliton Distribution with a "spike" to maintain the decoding *ripple* — the set of degree-1 packets available to the peeling decoder at each step.
+
+---
+
+## DegreeDistribution
+
+```rust
+pub trait DegreeDistribution {
+    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize;
+    fn expected_degree(&self) -> f64;
+}
+```
+
+Trait for swappable degree distributions in fountain codes. Implementations define how many source symbols are combined into a single encoded packet (the "degree").
+
+### sample_degree
+
+```rust
+fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize
+```
+
+Samples a degree $d$ satisfying the contract $1 \le d \le K$.
+
+<ParamField path="rng" type="&mut R" required>
+  Random number generator implementing the `rand::Rng` trait
+</ParamField>
+
+<ResponseField name="Return" type="usize">
+  A degree value in the range $[1, K]$, where $K$ is the number of source blocks
+</ResponseField>
+
+**Contract:**
+
+Implementations **must** guarantee the returned value lies in $[1, K]$, where $K$ is the number of source blocks. Values outside this range will cause out-of-bounds index selection during encoding.
+
+### expected_degree
+
+```rust
+fn expected_degree(&self) -> f64
+```
+
+Computes the expected value $E[D]$ of the distribution.
+
+<ResponseField name="Return" type="f64">
+  The average number of XOR operations per encoded packet under the current parameterization
+</ResponseField>
+
+Used for overhead estimation and diagnostic reporting.
+
+---
+
+## RobustSoliton
+
+```rust
+pub struct RobustSoliton {
+    pub c: f64,
+    pub delta: f64,
+    // private fields
+}
+```
+
+Robust Soliton Distribution (RSD) for LT (Luby Transform) codes.
+
+The RSD is designed to ensure that a decoder can always find a degree-1 packet to start the ripple, while maintaining enough high-degree packets to cover all source symbols.
+
+<Expandable title="Fields">
+  <ResponseField name="c" type="f64">
+    Free parameter that scales the spike magnitude $S = c \sqrt{K} \ln(K/\delta)$.
+    
+    Smaller values reduce overhead (fewer redundant droplets needed) at the cost of a thinner ripple and higher decoding-failure probability.
+  </ResponseField>
+
+  <ResponseField name="delta" type="f64">
+    Upper bound on decoding-failure probability after receiving $K \cdot (1 + \varepsilon)$ encoded symbols.
+    
+    Appears in $S = c \sqrt{K} \ln(K/\delta)$; tighter bounds (smaller `delta`) widen the spike and increase the expected degree.
+  </ResponseField>
+</Expandable>
+
+### Methods
+
+#### new
+
+```rust
+pub fn new(k: usize, c: f64, delta: f64) -> Self
+```
+
+Creates a new `RobustSoliton` distribution for epoch size `k`.
+
+<ParamField path="k" type="usize" required>
+  Number of source blocks in the epoch ($K$)
+</ParamField>
+
+<ParamField path="c" type="f64" required>
+  Tuning constant that scales the spike magnitude. Typical values: 0.01 to 0.1
+</ParamField>
+
+<ParamField path="delta" type="f64" required>
+  Failure probability bound. Must be in the range $(0, 1)$. Typical values: 0.01 to 0.1
+</ParamField>
+
+Pre-computes the CDF over degrees $[1, k]$ so that subsequent calls to `sample_degree` are $O(\log k)$.
+
+**Panics:**
+
+Panics if `k == 0`, `c <= 0.0`, or `delta` is not in the range $(0, 1)$.
+
+**Example:**
+
+```rust
+use sef::distribution::RobustSoliton;
+
+let rsd = RobustSoliton::new(1024, 0.1, 0.05);
+assert_eq!(rsd.k(), 1024);
+```
+
+---
+
+#### rebuild
+
+```rust
+pub fn rebuild(&mut self, k: usize)
+```
+
+Rebuilds the CDF for a new epoch size `k`, retaining `c` and `delta`.
+
+<ParamField path="k" type="usize" required>
+  New number of source blocks
+</ParamField>
+
+This is an $O(k)$ operation. A no-op if `k` equals the current value.
+
+**Panics:**
+
+Panics if `k == 0`.
+
+**Use case:**
+
+Relevant when reusing a single `RobustSoliton` instance across epochs of different sizes — call `rebuild` whenever `k` changes.
+
+---
+
+#### k
+
+```rust
+pub fn k(&self) -> usize
+```
+
+Returns the source-block count $K$ for which the CDF is currently computed.
+
+<ResponseField name="Return" type="usize">
+  Current epoch size
+</ResponseField>
+
+---
+
+### DegreeDistribution Implementation
+
+The `RobustSoliton` implements `DegreeDistribution`:
+
+#### sample_degree
+
+Draws a uniform variate $u \in [0, 1)$ and performs a binary search over the pre-computed CDF to return the corresponding degree in $[1, K]$.
+
+Time complexity: $O(\log K)$
+
+#### expected_degree
+
+Computes $E[D] = \sum_{d=1}^{K} d \cdot p(d)$ by differencing consecutive CDF entries to recover each probability mass $p(d)$.
+
+---
+
+## Mathematical Background
+
+The Robust Soliton Distribution is defined as:
+
+$$
+\mu(d) = \frac{\rho(d) + \tau(d)}{\beta}
+$$
+
+where:
+
+- $\rho(d)$ is the Ideal Soliton Distribution:
+  $$
+  \rho(d) = \begin{cases}
+    1/K & \text{if } d = 1 \\\\
+    1/(d(d-1)) & \text{if } d \in [2, K]
+  \end{cases}
+  $$
+
+- $\tau(d)$ is the spike function:
+  $$
+  \tau(d) = \begin{cases}
+    S/(dK) & \text{if } d < R \\\\
+    (S/K) \ln(S/\delta) & \text{if } d = R \\\\
+    0 & \text{otherwise}
+  \end{cases}
+  $$
+  
+  where $S = c \sqrt{K} \ln(K/\delta)$ and $R = \lfloor K/S \rfloor$
+
+- $\beta = \sum_{d=1}^{K} (\rho(d) + \tau(d))$ is the normalization constant
+
+### Parameters
+
+| Parameter | Meaning | Typical Value |
+|-----------|---------|---------------|
+| $K$ | Number of source blocks | Problem-specific |
+| $c$ | Spike scaling factor | 0.01 to 0.1 |
+| $\delta$ | Failure probability bound | 0.01 to 0.1 |
+
+**Trade-offs:**
+
+- **Smaller $c$**: Lower overhead (fewer droplets needed), but higher risk of ripple collapse
+- **Larger $c$**: Higher overhead, but more robust decoding
+- **Smaller $\delta$**: Stronger failure guarantee, but increases expected degree
+
+---
+
+## Example Usage
+
+```rust
+use sef::distribution::{RobustSoliton, DegreeDistribution};
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+
+let k = 256;
+let rsd = RobustSoliton::new(k, 0.1, 0.05);
+
+let mut rng = ChaCha8Rng::seed_from_u64(0);
+let degree = rsd.sample_degree(&mut rng);
+assert!((1..=k).contains(&degree));
+
+let avg = rsd.expected_degree();
+println!("Average degree: {:.2}", avg);
+```
+
+### Full Encoding Example
+
+```rust
+use sef::distribution::RobustSoliton;
+use sef::droplet::{EpochParams, Encoder};
+
+let k = 100;
+let blocks: Vec<Vec<u8>> = (0..k).map(|i| vec![i as u8; 64]).collect();
+
+// Create distribution with c=0.1, delta=0.05
+let rsd = RobustSoliton::new(k, 0.1, 0.05);
+let params = EpochParams::new(0, k as u32, [0u8; 32]);
+let encoder = Encoder::new(&params, &rsd, &blocks);
+
+// Generate droplets
+let droplets = encoder.generate_n(150);
+println!("Generated {} droplets", droplets.len());
+
+// Average degree
+let avg_degree: f64 = droplets.iter()
+    .map(|d| d.degree() as f64)
+    .sum::<f64>() / droplets.len() as f64;
+println!("Observed average degree: {:.2}", avg_degree);
+println!("Expected average degree: {:.2}", rsd.expected_degree());
+```
+
+---
+
+## Reference
+
+M. Luby, "LT Codes", *Proceedings of the 43rd Annual IEEE Symposium on Foundations of Computer Science (FOCS)*, 2002.

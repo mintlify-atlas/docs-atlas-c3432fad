@@ -1,0 +1,160 @@
+---
+title: "Architecture"
+description: "System architecture and data flow in the SeF fountain code library"
+---
+
+The SeF library implements a complete pipeline for encoding blockchain data with Luby Transform (LT) fountain codes and reconstructing it via the error-resilient peeling decoder.
+
+## System Overview
+
+SeF replaces archival full nodes with lightweight **droplet nodes** that store only a small fraction of the blockchain. A new **bucket node** can reconstruct the entire chain by collecting droplets from multiple droplet nodes and running the peeling decoder.
+
+<Note>
+When tuned for γ = k/s storage savings (k blocks per epoch, s droplets per node), a bucket node recovers the chain with probability ≥ 1 − δ by contacting **k + O(√k · ln²(k/δ))** honest nodes.
+</Note>
+
+## Data Flow Pipeline
+
+The architecture consists of two main paths: **encoding** and **decoding**.
+
+<Steps>
+  <Step title="Ingest blockchain data">
+    Read raw Bitcoin blocks from disk via the `chain` module. Supports both `blk*.dat` files and the `bitcoinkernel` API.
+
+    ```rust
+    use sef::chain::BlockSource;
+    ```
+  </Step>
+
+  <Step title="Partition into epochs">
+    Group blocks into fixed-size epochs of k blocks each. The `epoch` module provides configuration and deterministic seed derivation.
+
+    ```rust
+    use sef::epoch::{EpochConfig, compute_epoch_seed};
+
+    let seed = compute_epoch_seed(0, "000000000019d6689c085ae165831e93");
+    ```
+  </Step>
+
+  <Step title="Normalize symbols (optional)">
+    Concatenate variable-length blocks and slice them into uniform symbols to eliminate padding waste.
+
+    ```rust
+    use sef::symbol::blocks_to_symbols;
+
+    let symbols = blocks_to_symbols(&blocks, 4096);
+    ```
+  </Step>
+
+  <Step title="Encode droplets">
+    Sample degrees from the Robust Soliton Distribution and XOR source blocks to produce droplets.
+
+    ```rust
+    use sef::distribution::RobustSoliton;
+    use sef::droplet::{Encoder, EpochParams};
+
+    let dist = RobustSoliton::new(k, 0.1, 0.05);
+    let encoder = Encoder::new(&params, &dist, &blocks);
+    let droplets = encoder.generate_n(k * 3);
+    ```
+  </Step>
+
+  <Step title="Decode with peeling">
+    Recover all k source blocks by iteratively resolving singleton droplets and XORing them out of the graph.
+
+    ```rust
+    use sef::decoder::peeling_decode;
+
+    let result = peeling_decode(k, droplets, &verifier);
+    assert!(result.is_success());
+    ```
+  </Step>
+</Steps>
+
+## Architecture Diagram
+
+```
+Bitcoin datadir (blk*.dat / bitcoinkernel)
+  │
+  ▼
+┌─────────────┐     ┌──────────────┐     ┌───────────────┐
+│ BlockSource  │────▶│ for_each_    │────▶│ blocks_to_    │
+│ (chain)      │     │ epoch(k,buf) │     │ symbols(sz)   │
+└─────────────┘     └──────────────┘     └───────┬───────┘
+                                                 │ symbols
+                                                 ▼
+                    ┌──────────────┐     ┌───────────────┐
+                    │ Encoder::    │◀────│ RobustSoliton │
+                    │ generate(id) │     │ (distribution)│
+                    └──────┬───────┘     └───────────────┘
+                           │ droplets
+                           ▼
+                    ┌──────────────┐
+                    │ Droplet files│  ← consensus-serialized to disk
+                    └──────┬───────┘
+                           │
+              ─── network / storage ───
+                           │
+                           ▼
+                    ┌──────────────┐     ┌───────────────┐
+                    │ peeling_     │────▶│ BlockVerifier  │
+                    │ decode(k,..) │     │ (hash check)   │
+                    └──────┬───────┘     └───────────────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │ symbols_to_  │────▶ Recovered blocks
+                    │ blocks()     │
+                    └──────────────┘
+```
+
+## Module Reference
+
+| Module | Purpose | Key Types |
+|--------|---------|----------|
+| `chain` | Bitcoin block readers | `BlockSource`, `KernelBlockReader` |
+| `decoder` | Peeling decoder with verification | `peeling_decode`, `BlockVerifier` |
+| `distribution` | Robust Soliton Distribution | `RobustSoliton`, `DegreeDistribution` |
+| `droplet` | Droplet struct and encoder | `Droplet`, `Encoder`, `EpochParams` |
+| `encode` | Serialization and file I/O | Bitcoin consensus format |
+| `epoch` | Epoch config and seed derivation | `EpochConfig`, `compute_epoch_seed` |
+| `experiment` | Storage-reduction simulations | Graph-only (no payloads) |
+| `symbol` | Fixed-size symbol normalization | `SymbolManifest`, `blocks_to_symbols` |
+| `xor` | Bitwise XOR with padding | `xor_blocks`, `xor_into_fixed` |
+
+## Authenticated Side-Information
+
+The header chain acts as authenticated side-information. Merkle roots in block headers allow the decoder to detect and discard **murky droplets** (maliciously formed) on the fly without propagating errors.
+
+<Info>
+The `BlockVerifier` trait enables pluggable verification strategies. Implementations include `BitcoinBlockVerifier` (hash-based) and `SymbolVerifier` (SHA-256 manifest).
+</Info>
+
+## Example: End-to-End Round Trip
+
+```rust
+use sef::distribution::RobustSoliton;
+use sef::droplet::{Encoder, EpochParams};
+use sef::decoder::peeling_check;
+
+let k = 50;
+let blocks: Vec<Vec<u8>> = (0..k)
+    .map(|i| vec![(i & 0xFF) as u8; 256])
+    .collect();
+
+let params = EpochParams::new(0, k as u32, [0u8; 32]);
+let dist = RobustSoliton::new(k, 0.1, 0.05);
+let encoder = Encoder::new(&params, &dist, &blocks);
+
+// Generate 3x overhead droplets
+let droplets = encoder.generate_n((k as u64) * 3);
+
+// Verify recoverability via the peeling check
+let indices: Vec<Vec<u32>> = droplets.iter().map(|d| d.indices.clone()).collect();
+let result = peeling_check(k, &indices);
+assert!(result.success);
+```
+
+<Warning>
+The buffer parameter excludes recent blocks from encoding. This confirmation window ensures that the most recent blocks remain immediately accessible without decoding.
+</Warning>

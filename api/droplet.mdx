@@ -1,0 +1,161 @@
+---
+title: 'Droplet'
+description: 'Core data structures for fountain-coded droplets and epochs'
+---
+
+## Overview
+
+A `Droplet` is the fundamental unit of encoded data in SeF's LT fountain codes. Each droplet is formed by XORing $d$ source blocks together, where $d$ (the degree) is sampled from a degree distribution.
+
+## Droplet
+
+```rust
+pub struct Droplet {
+    pub epoch_id: u64,
+    pub droplet_id: u64,
+    pub indices: Vec<u32>,
+    pub padded_len: u32,
+    pub payload: Vec<u8>,
+}
+```
+
+A fountain-coded droplet encoding one or more source blocks via XOR.
+
+<Expandable title="Fields">
+  <ResponseField name="epoch_id" type="u64">
+    Epoch this droplet belongs to, linking it to a specific set of source blocks and their shared `EpochParams`.
+  </ResponseField>
+
+  <ResponseField name="droplet_id" type="u64">
+    Unique identifier within the epoch. Together with `EpochParams::epoch_seed`, this deterministically derives the per-droplet PRNG — making the encoding graph structure reproducible by any peer.
+  </ResponseField>
+
+  <ResponseField name="indices" type="Vec<u32>">
+    Sorted, unique indices of source blocks in $[0, K)$ that were XORed to form the payload. The length of this vector equals the sampled degree $d$.
+  </ResponseField>
+
+  <ResponseField name="padded_len" type="u32">
+    Byte length of the longest source block among those selected, used as the canonical payload size. Shorter blocks are implicitly zero-padded to this length during XOR.
+  </ResponseField>
+
+  <ResponseField name="payload" type="Vec<u8>">
+    The XOR-combined payload of the $d$ selected source blocks.
+  </ResponseField>
+</Expandable>
+
+### Methods
+
+#### degree
+
+```rust
+pub fn degree(&self) -> usize
+```
+
+Returns the degree of this droplet, representing the number of source blocks XOR'd to create the current payload.
+
+#### is_singleton
+
+```rust
+pub fn is_singleton(&self) -> bool
+```
+
+Returns `true` if this is a "singleton" (degree 1). Singletons are the entry points for the peeling decoder, as they contain a raw, un-XOR'd source block that can be recovered immediately.
+
+#### validate
+
+```rust
+pub fn validate(&self, k: u32) -> Result<(), String>
+```
+
+Verifies the structural integrity of the droplet against the epoch's $K$ value.
+
+<ParamField path="k" type="u32" required>
+  Number of source blocks in the epoch
+</ParamField>
+
+This ensures the droplet is decodable and won't cause panics during the peeling process. Specifically, it checks that:
+1. The degree is at least 1
+2. The payload length matches the advertised `padded_len`
+3. All indices are within the valid range $[0, K)$
+4. Indices are strictly increasing (no duplicates, sorted)
+
+<ResponseField name="Return" type="Result<(), String>">
+  `Ok(())` if validation succeeds, `Err(String)` with a descriptive error message otherwise
+</ResponseField>
+
+---
+
+## EpochParams
+
+```rust
+pub struct EpochParams {
+    pub epoch_id: u64,
+    pub k: u32,
+    pub epoch_seed: [u8; 32],
+}
+```
+
+Parameters for an epoch of blocks to be fountain-encoded. These parameters define the encoding context for a set of source blocks.
+
+<Expandable title="Fields">
+  <ResponseField name="epoch_id" type="u64">
+    Unique identifier for the epoch, typically used to distinguish between different files or data streams.
+  </ResponseField>
+
+  <ResponseField name="k" type="u32">
+    Number of source blocks in the epoch ($K$). This value determines the probability mass function of the Robust Soliton Distribution.
+  </ResponseField>
+
+  <ResponseField name="epoch_seed" type="[u8; 32]">
+    Root seed used to deterministically derive droplet-specific PRNGs. This ensures that the set of source block indices for droplet $N$ is stable across all peers.
+  </ResponseField>
+</Expandable>
+
+### Methods
+
+#### new
+
+```rust
+pub fn new(epoch_id: u64, k: u32, epoch_seed: [u8; 32]) -> Self
+```
+
+Constructs a new `EpochParams` from the given identifiers and seed.
+
+<ParamField path="epoch_id" type="u64" required>
+  Unique identifier for the epoch
+</ParamField>
+
+<ParamField path="k" type="u32" required>
+  Number of source blocks in the epoch
+</ParamField>
+
+<ParamField path="epoch_seed" type="[u8; 32]" required>
+  Root seed for deterministic droplet generation
+</ParamField>
+
+**Example:**
+
+```rust
+use sef::droplet::EpochParams;
+
+let params = EpochParams::new(1, 256, [0xAB; 32]);
+assert_eq!(params.k, 256);
+```
+
+---
+
+## Example Usage
+
+```rust
+use sef::distribution::RobustSoliton;
+use sef::droplet::{EpochParams, Encoder};
+
+let k = 10;
+let blocks: Vec<Vec<u8>> = (0..k).map(|i| vec![i as u8; 64]).collect();
+let params = EpochParams::new(0, k as u32, [0u8; 32]);
+let rsd = RobustSoliton::new(k, 0.1, 0.5);
+
+let encoder = Encoder::new(&params, &rsd, &blocks);
+let droplet = encoder.generate(0);
+assert!(droplet.validate(k as u32).is_ok());
+```

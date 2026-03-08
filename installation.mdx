@@ -1,0 +1,192 @@
+---
+title: Installation
+description: Install the SeF library via Cargo or build from source
+---
+
+# Installation
+
+SeF is a Rust library available as a crate. This guide covers installation methods and feature flag configuration.
+
+## Prerequisites
+
+<Note>
+  SeF requires Rust 1.70 or later. If you don't have Rust installed, visit [rustup.rs](https://rustup.rs/) to get started.
+</Note>
+
+Ensure you have:
+- Rust 1.70+ (edition 2024)
+- Cargo (included with Rust)
+
+## Installation via Cargo
+
+Add SeF to your `Cargo.toml`:
+
+<CodeGroup>
+```toml Cargo.toml
+[dependencies]
+sef = "0.1.0"
+```
+
+```toml With repository
+[dependencies]
+sef = { git = "https://github.com/abeeujah/sef" }
+```
+</CodeGroup>
+
+Then run:
+
+```bash
+cargo build
+```
+
+<Note>
+  By default, SeF enables the `kernel` feature which provides Bitcoin Core integration via `bitcoinkernel`.
+</Note>
+
+## Building from Source
+
+Clone the repository and build:
+
+<Steps>
+  <Step title="Clone the repository">
+    ```bash
+    git clone https://github.com/abeeujah/sef.git
+    cd sef
+    ```
+  </Step>
+  
+  <Step title="Build with default features">
+    ```bash
+    cargo build --release
+    ```
+    
+    This builds SeF with the `kernel` feature enabled, which includes Bitcoin Core integration.
+  </Step>
+  
+  <Step title="Run the CLI (optional)">
+    ```bash
+    cargo run --release -- --help
+    ```
+    
+    The SeF CLI provides commands for encoding, decoding, and experimenting with fountain codes.
+  </Step>
+</Steps>
+
+## Feature Flags
+
+SeF supports optional feature flags to customize functionality and dependencies.
+
+### `kernel` (Default: Enabled)
+
+Enables `KernelBlockReader` backed by `bitcoinkernel` for validated block access from a Bitcoin Core datadir.
+
+<CodeGroup>
+```toml Enable kernel (default)
+[dependencies]
+sef = "0.1.0"
+```
+
+```toml Disable kernel
+[dependencies]
+sef = { version = "0.1.0", default-features = false }
+```
+</CodeGroup>
+
+**Build without the kernel feature:**
+
+```bash
+cargo build --release --no-default-features
+```
+
+<Warning>
+  Without the `kernel` feature, SeF will only support raw `blk*.dat` file parsing. This may be useful for environments where `bitcoinkernel` is unavailable.
+</Warning>
+
+### Feature Flag Reference
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `kernel` | **yes** | Enables `KernelBlockReader` backed by `bitcoinkernel` for validated block access from a Bitcoin Core datadir |
+
+## Dependencies
+
+SeF relies on the following core dependencies:
+
+```toml
+[dependencies]
+rand = "0.8"              # Random number generation
+rand_chacha = "0.3"       # ChaCha8 PRNG for deterministic encoding
+sha2 = "0.10"             # SHA-256 hashing for seed derivation
+clap = { version = "4", features = ["derive"] }  # CLI argument parsing
+bitcoinkernel = { version = "0.1", optional = true }  # Bitcoin Core integration
+bitcoin = { version = "0.32", features = ["std"] }   # Bitcoin block parsing
+```
+
+## Verifying Installation
+
+Create a simple test to verify SeF is working:
+
+```rust src/main.rs
+use sef::distribution::RobustSoliton;
+use sef::droplet::{Encoder, EpochParams};
+use sef::decoder::peeling_check;
+
+fn main() {
+    let k = 50;
+    let blocks: Vec<Vec<u8>> = (0..k)
+        .map(|i| vec![(i & 0xFF) as u8; 256])
+        .collect();
+
+    let params = EpochParams::new(0, k as u32, [0u8; 32]);
+    let dist = RobustSoliton::new(k, 0.1, 0.05);
+    let encoder = Encoder::new(&params, &dist, &blocks);
+
+    let droplets = encoder.generate_n((k as u64) * 3);
+    
+    let indices: Vec<Vec<u32>> = droplets.iter()
+        .map(|d| d.indices.clone())
+        .collect();
+    let result = peeling_check(k, &indices);
+    
+    println!("SeF is working! Decoded {}/{} blocks", result.decoded, result.total);
+    assert!(result.success);
+}
+```
+
+Run the test:
+
+```bash
+cargo run
+```
+
+You should see:
+
+```
+SeF is working! Decoded 50/50 blocks
+```
+
+## CLI Installation
+
+To install the SeF CLI globally:
+
+```bash
+cargo install --path . --locked
+```
+
+Verify the installation:
+
+```bash
+sef --version
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Learn how to encode and decode blocks with a complete working example.
+  </Card>
+  
+  <Card title="Introduction" icon="book" href="/introduction">
+    Understand the SeF architecture and how fountain codes work.
+  </Card>
+</CardGroup>

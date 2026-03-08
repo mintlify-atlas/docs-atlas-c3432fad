@@ -1,0 +1,141 @@
+---
+title: Introduction
+description: Learn about SeF (Secure Fountain), a Rust library for slashing blockchain storage costs using fountain codes
+---
+
+# SeF — Secure Fountain Architecture
+
+SeF is a Rust implementation of the **Secure Fountain (SeF)** architecture from [Kadhe, Chung & Ramchandran (2019)](https://arxiv.org/abs/1906.12140), which uses Luby Transform (LT) fountain codes to slash blockchain storage costs by orders of magnitude.
+
+## What is SeF?
+
+Full nodes today must store the entire blockchain — hundreds of gigabytes for Bitcoin, terabytes for high-throughput chains. SeF replaces archival full nodes with lightweight **droplet nodes** that store only a fraction of the data while maintaining the ability to reconstruct the full chain.
+
+<Note>
+  SeF uses fountain codes to encode blockchain data into **droplets** — coded blocks that can be XOR'd together to recover original blocks, even when some nodes supply adversarial data.
+</Note>
+
+## How It Works
+
+<Steps>
+  <Step title="Partition into epochs">
+    The blockchain is divided into **epochs** of k blocks (e.g., 100-10000 blocks per epoch).
+  </Step>
+  
+  <Step title="Fountain encoding">
+    Each epoch is fountain-encoded: blocks are XOR'd together according to degrees sampled from the **Robust Soliton Distribution** to produce droplets (coded blocks).
+  </Step>
+  
+  <Step title="Distributed storage">
+    Each droplet node stores only s ≪ k droplets per epoch, achieving **γ = k/s** storage savings.
+  </Step>
+  
+  <Step title="Reconstruction">
+    A new **bucket node** contacts a set of droplet nodes, unions their droplets, and runs the **error-resilient peeling decoder** to reconstruct the original blocks.
+  </Step>
+</Steps>
+
+## Key Benefits
+
+<CardGroup cols={2}>
+  <Card title="Massive Storage Reduction" icon="database">
+    Store only s ≪ k droplets per node instead of all k blocks, achieving storage reduction factor γ = k/s.
+  </Card>
+  
+  <Card title="Byzantine Fault Tolerance" icon="shield">
+    The header chain acts as authenticated side-information: Merkle roots in block headers let the decoder detect and discard murky (adversarial) droplets on the fly.
+  </Card>
+  
+  <Card title="Probabilistic Guarantees" icon="chart-line">
+    Recover the chain with probability ≥ 1 − δ by contacting **k + O(√k · ln²(k/δ))** honest nodes.
+  </Card>
+  
+  <Card title="Efficient Decoding" icon="bolt">
+    The peeling decoder runs in near-linear time, iteratively resolving singleton droplets to recover source blocks.
+  </Card>
+</CardGroup>
+
+## Architecture Overview
+
+SeF provides a complete pipeline for blockchain fountain coding:
+
+```
+Bitcoin datadir (blk*.dat / bitcoinkernel)
+  │
+  ▼
+┌─────────────┐     ┌──────────────┐     ┌───────────────┐
+│ BlockSource  │────▶│ for_each_    │────▶│ blocks_to_    │
+│ (chain)      │     │ epoch(k,buf) │     │ symbols(sz)   │
+└─────────────┘     └──────────────┘     └───────┬───────┘
+                                                 │ symbols
+                                                 ▼
+                    ┌──────────────┐     ┌───────────────┐
+                    │ Encoder::    │◀────│ RobustSoliton │
+                    │ generate(id) │     │ (distribution)│
+                    └──────┬───────┘     └───────────────┘
+                           │ droplets
+                           ▼
+                    ┌──────────────┐
+                    │ Droplet files│  ← consensus-serialized to disk
+                    └──────┬───────┘
+                           │
+              ─── network / storage ───
+                           │
+                           ▼
+                    ┌──────────────┐     ┌───────────────┐
+                    │ peeling_     │────▶│ BlockVerifier  │
+                    │ decode(k,..) │     │ (hash check)   │
+                    └──────┬───────┘     └───────────────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │ symbols_to_  │────▶ Recovered blocks
+                    │ blocks()     │
+                    └──────────────┘
+```
+
+## Core Modules
+
+| Module | Purpose |
+|--------|--------|
+| `chain` | Bitcoin block readers (`blk*.dat` and `bitcoinkernel` backends) |
+| `decoder` | Peeling decoder with pluggable block verification |
+| `distribution` | Robust Soliton Distribution (RSD) for degree sampling |
+| `droplet` | `Droplet` struct, `EpochParams`, and `Encoder` |
+| `encode` | Bitcoin consensus serialization and file I/O for droplets |
+| `epoch` | Epoch configuration, seed derivation, auto-scaling heuristics |
+| `experiment` | Storage-reduction simulations (graph-only, no XOR payloads) |
+| `symbol` | Fixed-size symbol normalization and `SymbolManifest` |
+| `xor` | Bitwise XOR with adaptive zero-padding |
+
+## Key Parameters
+
+<Warning>
+  Proper parameter tuning is critical for achieving desired storage reduction while maintaining high decoding success probability.
+</Warning>
+
+| Parameter | Typical Range | Description |
+|-----------|---------------|-------------|
+| `k` | 100–10000 | Epoch size — number of source blocks per epoch |
+| `s` | 5–50 | Droplets stored per node; γ = k/s is the storage reduction factor |
+| `c` | 0.1 | RSD tuning constant controlling the degree-1 spike |
+| `δ` | 0.05 | Tolerable decoding failure probability |
+| `symbol_size` | 4096 | Fixed symbol size in bytes for block concatenation (0 = disabled) |
+| `buffer` | 10 | Recent blocks excluded from encoding (confirmation window) |
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Get started by installing SeF via Cargo or building from source.
+  </Card>
+  
+  <Card title="Quick Start" icon="rocket" href="/quickstart">
+    Learn how to encode and decode blocks with a complete working example.
+  </Card>
+</CardGroup>
+
+## References
+
+- S. Kadhe, J. Chung, and K. Ramchandran, *"SeF: A Secure Fountain Architecture for Slashing Storage Costs in Blockchains,"* arXiv:1906.12140, 2019. [https://arxiv.org/abs/1906.12140](https://arxiv.org/abs/1906.12140)
+- M. Luby, *"LT Codes,"* Proc. 43rd IEEE FOCS, 2002.

@@ -1,0 +1,615 @@
+---
+title: Troubleshooting
+description: Common errors, debugging strategies, and solutions for SeF fountain codes
+---
+
+# Troubleshooting
+
+This guide covers common issues encountered when using SeF, along with debugging strategies and solutions.
+
+## Common Errors
+
+### Encoding Errors
+
+#### Error: `blocks.len() != k`
+
+**Symptom:**
+```
+thread 'main' panicked at 'blocks.len() (95) != k (100)'
+```
+
+**Cause:** The number of blocks provided to the encoder doesn't match the configured epoch size `k`.
+
+**Solution:**
+
+```rust src/droplet.rs:163-170
+// Ensure blocks.len() == params.k
+let k = 100;
+let mut blocks: Vec<Vec<u8>> = read_blocks_from_source()?;
+
+// Option 1: Pad with empty blocks
+while blocks.len() < k {
+    blocks.push(Vec::new());
+}
+
+// Option 2: Adjust k to match actual block count
+let k = blocks.len();
+let params = EpochParams::new(epoch_id, k as u32, seed);
+```
+
+<Tip>
+Use [`epoch::EpochConfig`](/workspace/source/src/epoch.rs:20-53) to dynamically set `k` based on actual block count rather than hardcoding it.
+</Tip>
+
+---
+
+#### Error: `epoch size k must be > 0`
+
+**Symptom:**
+```
+thread 'main' panicked at 'epoch size k must be > 0'
+```
+
+**Cause:** Attempted to create a `RobustSoliton` distribution with `k=0`.
+
+**Solution:**
+
+```rust src/distribution.rs:106-109
+// Check for empty input before creating distribution
+if blocks.is_empty() {
+    eprintln!("Warning: No blocks to encode");
+    return Ok(());
+}
+
+let k = blocks.len();
+let dist = RobustSoliton::new(k, 0.1, 0.05);
+```
+
+---
+
+#### Error: `symbol_size must be positive`
+
+**Symptom:**
+```
+thread 'main' panicked at 'symbol_size must be positive'
+```
+
+**Cause:** Passed `symbol_size=0` to `blocks_to_symbols`.
+
+**Solution:**
+
+```rust src/symbol.rs:103-104
+// Either disable symbols (use blocks directly):
+let symbols = blocks; // No normalization
+
+// Or use a valid symbol size:
+let (symbols, manifest) = blocks_to_symbols(&blocks, 4096);
+```
+
+<Note>
+Setting `symbol_size=0` in `EpochConfig` disables symbol slicing and encodes raw blocks directly. This is valid for uniform block sizes.
+</Note>
+
+---
+
+### Decoding Errors
+
+#### Error: Decode Stalled Before Completion
+
+**Symptom:**
+```
+Decode failed: Stalled at 87/100 blocks (87% complete)
+Stop reason: Stalled
+Failures: [BlockFailure { index: 12, referenced_by: 3 }, ...]
+```
+
+**Cause:** Insufficient droplets or unlucky degree distribution caused the peeling ripple to collapse.
+
+**Diagnosis:**
+
+```rust src/decoder.rs:281-289
+let result = peeling_decode(k, droplets, &verifier);
+
+if !result.is_success() {
+    eprintln!("Decoded: {}/{}", result.decoded_count, result.k);
+    eprintln!("Stop reason: {:?}", result.stop_reason);
+    
+    // Check which blocks failed
+    for failure in &result.failures {
+        eprintln!("Block {} unreachable (referenced by {} droplets)",
+                  failure.index, failure.referenced_by);
+    }
+}
+```
+
+**Solutions:**
+
+<Accordion title="Solution 1: Increase Droplet Count">
+
+```rust
+// Before (insufficient)
+let n = k as u64 * 2; // Only 2× overhead
+
+// After (recommended)
+let n = auto_scale_droplets(k, 0); // Auto: 3–5× depending on k
+```
+
+See [Performance > Auto-Scaling](/advanced/performance#auto-scaling-droplet-count) for guidelines.
+
+</Accordion>
+
+<Accordion title="Solution 2: Increase c Parameter">
+
+```rust
+// Before (thin ripple)
+let dist = RobustSoliton::new(k, 0.01, 0.05);
+
+// After (thicker ripple, more singletons)
+let dist = RobustSoliton::new(k, 0.15, 0.05);
+```
+
+Larger `c` increases the degree-1 spike, ensuring more entry points for the peeling decoder.
+
+</Accordion>
+
+<Accordion title="Solution 3: Relax Delta">
+
+```rust
+// Before (tight bound, high overhead)
+let dist = RobustSoliton::new(k, 0.1, 0.01);
+
+// After (looser bound, more efficient)
+let dist = RobustSoliton::new(k, 0.1, 0.05);
+```
+
+<Warning>
+This trades decode reliability for lower overhead. Only use for non-critical applications.
+</Warning>
+
+</Accordion>
+
+---
+
+#### Error: Hash Mismatch for Block
+
+**Symptom:**
+```
+Verify error: hash mismatch for block 42: expected 00000000000000000019d6..., got 0000000000000000001a3f...
+```
+
+**Cause:** One of three issues:
+1. Corrupted droplet payload (network transmission error)
+2. Wrong epoch seed used during encoding
+3. Adversarial (murky) droplet from Byzantine node
+
+**Diagnosis:**
+
+```rust src/decoder.rs:214-226
+impl BlockVerifier for BitcoinBlockVerifier {
+    fn verify_and_len(&self, block_idx: u32, candidate: &[u8]) -> Result<usize, VerifyError> {
+        let (block, used) = deserialize_partial(candidate)
+            .map_err(|e| VerifyError::Deserialize(e.to_string()))?;
+        
+        let hash = block.block_hash();
+        let expected = &self.expected_hashes[block_idx as usize];
+        
+        if hash != *expected {
+            return Err(VerifyError::HashMismatch { ... });
+        }
+        // ...
+    }
+}
+```
+
+**Solutions:**
+
+<Accordion title="Solution 1: Check Epoch Seed Consistency">
+
+```rust
+// Encoder side:
+let seed = compute_epoch_seed(epoch_idx, first_block_hash);
+let params = EpochParams::new(epoch_id, k, seed);
+
+// Decoder side: MUST use identical seed
+let seed = compute_epoch_seed(epoch_idx, first_block_hash);
+// Verify first_block_hash matches the chain
+```
+
+<Warning>
+Epoch seeds MUST be deterministic and bound to chain data. Use [`epoch::compute_epoch_seed`](/workspace/source/src/epoch.rs:62-69) for proper domain separation.
+</Warning>
+
+</Accordion>
+
+<Accordion title="Solution 2: Verify Droplet Integrity">
+
+```rust
+// Validate droplet structure before decoding
+for droplet in &droplets {
+    if let Err(e) = droplet.validate(k) {
+        eprintln!("Droplet {} invalid: {}", droplet.droplet_id, e);
+        // Remove or skip this droplet
+    }
+}
+```
+
+See [`Droplet::validate`](/workspace/source/src/droplet.rs:251-278) for structural checks.
+
+</Accordion>
+
+<Accordion title="Solution 3: Handle Byzantine Nodes">
+
+The decoder is designed to tolerate murky droplets:
+
+```rust src/decoder.rs:491-497
+Err(_e) => {
+    // Verification failed — disable this droplet and continue
+    droplet_disabled[di] = true;
+    verify_failures += 1;
+    // ...
+}
+```
+
+**Monitor `verify_failures`:**
+
+```rust
+let result = peeling_decode(k, droplets, &verifier);
+
+if result.verify_failures > 0 {
+    eprintln!("Warning: {} droplets failed verification", result.verify_failures);
+    // Log source nodes for blacklisting
+}
+```
+
+If `verify_failures` is high (>10%), the network may be under attack.
+
+</Accordion>
+
+---
+
+#### Error: Deserialize Error
+
+**Symptom:**
+```
+Verify error: deserialize error: invalid block header
+```
+
+**Cause:** Recovered bytes are not valid Bitcoin consensus-serialized data.
+
+**Common Scenarios:**
+1. Wrong `BlockVerifier` used (e.g., `BitcoinBlockVerifier` for symbol-mode data)
+2. Payload length mismatch (`padded_len` incorrect)
+3. Encoding/decoding symbol size mismatch
+
+**Solution:**
+
+<Accordion title="Scenario 1: Symbol-Mode Decoding">
+
+For symbol-normalized data, use `SymbolVerifier` instead of `BitcoinBlockVerifier`:
+
+```rust src/decoder.rs:242-277
+// Load manifest from encoding phase
+let manifest: SymbolManifest = deserialize_manifest(&manifest_bytes)?;
+
+let verifier = SymbolVerifier {
+    symbol_size: manifest.symbol_size,
+    symbol_hashes: &manifest.symbol_hashes,
+};
+
+let result = peeling_decode(manifest.total_symbols, symbol_droplets, &verifier);
+
+// Convert symbols back to blocks
+let blocks = symbols_to_blocks(&result.blocks, &manifest);
+```
+
+</Accordion>
+
+<Accordion title="Scenario 2: Padding Length Validation">
+
+```rust
+// Droplet validation catches this:
+let droplet = Droplet { /* ... */ };
+
+if let Err(e) = droplet.validate(k) {
+    if e.contains("payload length") {
+        eprintln!("Payload/padded_len mismatch: {}", e);
+        // Droplet is malformed; discard
+    }
+}
+```
+
+</Accordion>
+
+---
+
+### Chain Reader Errors
+
+#### Error: `bitcoinkernel` Build Failed
+
+**Symptom:**
+```
+error: linking with `cc` failed
+note: ld: library not found for -lbitcoinkernel
+```
+
+**Cause:** Missing `bitcoinkernel` C library or build tools.
+
+**Solution:**
+
+```bash
+# Option 1: Disable kernel feature
+cargo build --no-default-features
+
+# Option 2: Install build dependencies
+# Debian/Ubuntu:
+sudo apt install build-essential pkg-config
+
+# macOS:
+brew install gcc pkg-config
+
+# Retry build
+cargo clean
+cargo build --release
+```
+
+See [Feature Flags > Troubleshooting](/advanced/feature-flags#troubleshooting) for details.
+
+---
+
+#### Error: Cannot Open Blocks Directory
+
+**Symptom:**
+```
+Error: No such file or directory (os error 2)
+```
+
+**Cause:** Invalid path to Bitcoin Core `blocks/` directory.
+
+**Solution:**
+
+```rust
+use std::path::Path;
+
+// Verify path exists before creating reader
+let blocks_dir = Path::new("/home/user/.bitcoin/signet/blocks");
+
+if !blocks_dir.exists() {
+    eprintln!("Error: Blocks directory not found: {:?}", blocks_dir);
+    return Err("Invalid blocks directory".into());
+}
+
+let reader = KernelBlockReader::new(
+    blocks_dir.parent().unwrap(), // Parent dir (e.g., ~/.bitcoin/signet)
+    ChainType::Signet,
+)?;
+```
+
+<Note>
+`KernelBlockReader::new` expects the **chain data directory** (e.g., `~/.bitcoin/signet`), not the `blocks/` subdirectory.
+</Note>
+
+---
+
+## Debugging Strategies
+
+### 1. Enable Verbose Logging
+
+```rust
+// Add debug output to track encoding progress
+let encoder = Encoder::new(&params, &dist, &blocks);
+
+for id in 0..n {
+    if id % 100 == 0 {
+        eprintln!("Generated {}/{} droplets", id, n);
+    }
+    let droplet = encoder.generate(id);
+    // ...
+}
+```
+
+### 2. Validate Droplet Graph Structure
+
+Use `peeling_check` (graph-only, no payloads) to verify recoverability before full decode:
+
+```rust src/decoder.rs:73-132
+use sef::decoder::peeling_check;
+
+// Extract indices only
+let indices: Vec<Vec<u32>> = droplets.iter()
+    .map(|d| d.indices.clone())
+    .collect();
+
+let result = peeling_check(k, &indices);
+
+if !result.success {
+    eprintln!("Warning: Droplet graph is insufficient");
+    eprintln!("Decoded: {}/{}", result.decoded, result.total);
+    // Request more droplets before attempting full decode
+}
+```
+
+<Tip>
+`peeling_check` is **10–100× faster** than full decode and uses minimal memory. Run it first to fail fast.
+</Tip>
+
+### 3. Inspect Degree Distribution
+
+Verify the RSD is producing expected degrees:
+
+```rust
+use sef::distribution::{RobustSoliton, DegreeDistribution};
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+
+let dist = RobustSoliton::new(k, c, delta);
+let mut rng = ChaCha8Rng::seed_from_u64(0);
+
+let mut degree_hist = vec![0; k + 1];
+for _ in 0..10000 {
+    let d = dist.sample_degree(&mut rng);
+    degree_hist[d] += 1;
+}
+
+for (d, count) in degree_hist.iter().enumerate() {
+    if *count > 0 {
+        println!("Degree {}: {:.2}%", d, (*count as f64) / 100.0);
+    }
+}
+
+println!("Expected degree: {:.2}", dist.expected_degree());
+```
+
+**Expected Output (k=100, c=0.1, delta=0.05):**
+```
+Degree 1: 12.5%
+Degree 2: 18.3%
+Degree 3: 14.2%
+...
+Expected degree: 5.67
+```
+
+### 4. Monitor Memory Usage
+
+```bash
+# Linux: Use /usr/bin/time for detailed stats
+/usr/bin/time -v ./target/release/sef generate --k 1000 ...
+
+# Look for:
+# Maximum resident set size (kbytes): 512000  (~512 MB)
+```
+
+If memory usage exceeds expectations:
+- Reduce `k` or `symbol_size`
+- Enable streaming droplet generation (generate one at a time)
+- Use `buffer` parameter to limit in-memory blocks
+
+### 5. Run Experiments to Tune Parameters
+
+```bash
+sef experiment --k 100 --c 0.1 --delta 0.05 --trials 500 --pool-size 1000
+```
+
+Output shows success rates for various configurations:
+```
+Configuration: k=100, s=10, K=15 nodes contacted
+  Success rate: 87.4%
+  Mean decoded: 97.2/100
+  Mean distinct droplets: 142.3
+```
+
+If success rate < 95%, increase `c`, `n`, or reduce `s`.
+
+---
+
+## Error Messages Reference
+
+### Encoding Phase
+
+| Error Message | Location | Cause | Solution |
+|---------------|----------|-------|----------|
+| `blocks.len() != k` | [droplet.rs:163](/workspace/source/src/droplet.rs:163-170) | Block count mismatch | Adjust `k` or pad blocks |
+| `epoch size k must be > 0` | [distribution.rs:107](/workspace/source/src/distribution.rs:106-109) | Empty epoch | Check input blocks |
+| `c must be > 0.0` | [distribution.rs:108](/workspace/source/src/distribution.rs:106-109) | Invalid RSD parameter | Use `c ∈ (0, 1)` |
+| `delta must be in (0, 1)` | [distribution.rs:109](/workspace/source/src/distribution.rs:106-109) | Invalid RSD parameter | Use `delta ∈ (0, 1)` |
+| `symbol_size must be positive` | [symbol.rs:104](/workspace/source/src/symbol.rs:103-104) | Zero symbol size | Use `symbol_size > 0` |
+
+### Decoding Phase
+
+| Error Message | Location | Cause | Solution |
+|---------------|----------|-------|----------|
+| `hash mismatch for block` | [decoder.rs:170](/workspace/source/src/decoder.rs:166-176) | Corrupted/wrong data | Verify epoch seed, check for murky droplets |
+| `deserialize error` | [decoder.rs:165](/workspace/source/src/decoder.rs:162-178) | Invalid block format | Check `BlockVerifier` type matches data |
+| `non-zero padding bytes` | [decoder.rs:175](/workspace/source/src/decoder.rs:160-178) | Security check failed | Block data extends beyond expected length |
+| `droplet has no indices` | [droplet.rs:253](/workspace/source/src/droplet.rs:251-278) | Malformed droplet | Validate before decode |
+| `payload length != padded_len` | [droplet.rs:255](/workspace/source/src/droplet.rs:251-278) | Payload size mismatch | Droplet corrupted in transit |
+| `index >= k` | [droplet.rs:265](/workspace/source/src/droplet.rs:251-278) | Out-of-range index | Droplet references non-existent block |
+
+---
+
+## Performance Issues
+
+### Slow Encoding
+
+**Symptom:** Generating droplets takes >1 second per 100 droplets.
+
+**Diagnosis:**
+
+```bash
+# Profile with perf (Linux)
+cargo build --release
+perf record --call-graph dwarf ./target/release/sef generate ...
+perf report
+
+# Look for hotspots in xor::xor_blocks
+```
+
+**Solutions:**
+
+1. **Enable symbol normalization** — Fixed-size XOR is faster
+2. **Reduce block size** — XOR complexity is `O(block_len)`
+3. **Reduce expected degree** — Lower `c` parameter
+
+### Slow Decoding
+
+**Symptom:** `peeling_decode` takes >10 seconds for k=1000.
+
+**Diagnosis:**
+
+```rust
+use std::time::Instant;
+
+let start = Instant::now();
+let result = peeling_decode(k, droplets, &verifier);
+let elapsed = start.elapsed();
+
+eprintln!("Decode time: {:.2}s", elapsed.as_secs_f64());
+eprintln!("Iterations: {}", result.iterations);
+eprintln!("Verify failures: {}", result.verify_failures);
+```
+
+If `iterations >> k`, the graph has many duplicate singletons (inefficient).
+
+**Solutions:**
+
+1. **Increase `c`** — More unique singletons, fewer redundant peels
+2. **Reduce `k`** — Smaller graphs decode faster
+3. **Optimize BlockVerifier** — Cache hash computations if possible
+
+---
+
+## Getting Help
+
+<Accordion title="Reporting Bugs">
+
+1. Check [GitHub Issues](https://github.com/abeeujah/sef/issues) for existing reports
+2. Provide:
+   - SeF version (`cargo tree | grep sef`)
+   - Minimal reproduction case
+   - Full error message and stack trace
+   - Configuration parameters (`k`, `c`, `delta`, `symbol_size`)
+
+</Accordion>
+
+<Accordion title="Community Support">
+
+- **GitHub Discussions:** [abeeujah/sef/discussions](https://github.com/abeeujah/sef/discussions)
+- **Research Paper:** [SeF arXiv:1906.12140](https://arxiv.org/abs/1906.12140)
+
+</Accordion>
+
+<Accordion title="Contributing Fixes">
+
+See the [Contributing Guide](https://github.com/abeeujah/sef#contributing) for:
+- Setting up the development environment
+- Running tests (`cargo test`)
+- Submitting pull requests
+
+</Accordion>
+
+---
+
+## Related Documentation
+
+- [Performance Tuning](/advanced/performance) — Optimize parameters for your use case
+- [Feature Flags](/advanced/feature-flags) — Compilation configuration
+- [API Reference](/api/droplet) — Detailed module documentation

@@ -1,97 +1,151 @@
 ---
-title: "Introduction"
-description: "Welcome to the new home for your documentation"
+title: "SeF: Secure Fountain Architecture"
+description: "Slash blockchain storage costs by orders of magnitude using Luby Transform fountain codes"
 ---
 
-## Setting up
+<div style={{
+  background: 'linear-gradient(135deg, #b21e1e 0%, #c1272d 100%)',
+  borderRadius: '12px',
+  padding: '48px 32px',
+  color: '#ffffff',
+  marginBottom: '32px'
+}}>
+  <h1 style={{
+    fontSize: '42px',
+    fontWeight: '700',
+    marginBottom: '16px',
+    color: '#ffffff'
+  }}>
+    Secure Fountain Architecture
+  </h1>
+  <p style={{
+    fontSize: '20px',
+    opacity: '0.95',
+    maxWidth: '800px',
+    lineHeight: '1.6'
+  }}>
+    A Rust implementation of the Secure Fountain (SeF) architecture that uses Luby Transform fountain codes to reduce blockchain storage requirements by orders of magnitude. Full nodes store only a small fraction of coded droplets per epoch instead of the entire blockchain.
+  </p>
+</div>
 
-Get your documentation site up and running in minutes.
+## What is SeF?
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+SeF replaces archival full nodes with lightweight **droplet nodes** that store only a fraction of the blockchain. Using fountain codes, the chain is encoded into coded blocks called **droplets**. Any new node can reconstruct the full blockchain by collecting droplets from multiple peers and running an error-resilient decoder.
 
-## Make it yours
-
-Design a docs site that looks great and empowers your users.
-
-<Columns cols={2}>
-  <Card
-    title="Edit locally"
-    icon="pen-to-square"
-    href="/development"
-  >
-    Edit your docs locally and preview them in real time.
+<CardGroup cols={2}>
+  <Card title="Storage Reduction" icon="hard-drive">
+    Store only **s ≪ k** droplets per epoch instead of k full blocks, achieving γ = k/s compression
   </Card>
-  <Card
-    title="Customize your site"
-    icon="palette"
-    href="/essentials/settings"
-  >
-    Customize the design and colors of your site to match your brand.
+  <Card title="Error Resilience" icon="shield-check">
+    Authenticated verification via Merkle roots detects and discards adversarial droplets without propagating errors
   </Card>
-    <Card
-    title="Set up navigation"
-    icon="map"
-    href="/essentials/navigation"
-  >
-    Organize your docs to help users find what they need and succeed with your product.
+  <Card title="Efficient Recovery" icon="arrows-rotate">
+    Reconstruct the chain with probability ≥ 1 − δ by contacting k + O(√k · ln²(k/δ)) honest nodes
   </Card>
-  <Card
-    title="API documentation"
-    icon="terminal"
-    href="/api-reference/introduction"
-  >
-    Auto-generate API documentation from OpenAPI specifications.
+  <Card title="Bitcoin Integration" icon="bitcoin">
+    Read blocks from Bitcoin Core datadir via blk*.dat files or bitcoinkernel
   </Card>
-</Columns>
+</CardGroup>
 
-## Create beautiful pages
+## Key Features
 
-Everything you need to create world-class documentation.
+<CardGroup cols={3}>
+  <Card title="Luby Transform Codes" icon="binary">
+    Industry-standard LT fountain codes with Robust Soliton Distribution
+  </Card>
+  <Card title="Peeling Decoder" icon="layer-group">
+    Error-resilient graph decoder with pluggable block verification
+  </Card>
+  <Card title="Epoch-based Encoding" icon="clock">
+    Partition chains into epochs of k blocks for scalable encoding
+  </Card>
+  <Card title="Symbol Normalization" icon="align-justify">
+    Fixed-size symbol slicing eliminates padding waste
+  </Card>
+  <Card title="CLI Tool" icon="terminal">
+    Generate, decode, and reconstruct operations via command-line
+  </Card>
+  <Card title="Storage Experiments" icon="flask">
+    Simulation framework for storage reduction analysis
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="Write with MDX"
-    icon="pen-fancy"
-    href="/essentials/markdown"
-  >
-    Use MDX to style your docs pages.
-  </Card>
-  <Card
-    title="Code samples"
-    icon="code"
-    href="/essentials/code"
-  >
-    Add sample code to demonstrate how to use your product.
-  </Card>
-  <Card
-    title="Images"
-    icon="image"
-    href="/essentials/images"
-  >
-    Display images and other media.
-  </Card>
-  <Card
-    title="Reusable snippets"
-    icon="recycle"
-    href="/essentials/reusable-snippets"
-  >
-    Write once and reuse across your docs.
-  </Card>
-</Columns>
+## Quick Start
 
-## Need inspiration?
+Get up and running with SeF in minutes.
 
-<Card
-  title="See complete examples"
-  icon="stars"
-  href="https://mintlify.com/customers"
->
-  Browse our showcase of exceptional documentation sites.
-</Card>
+<Steps>
+  <Step title="Install SeF">
+    Add SeF to your Rust project or build the CLI tool
+    
+    ```toml Cargo.toml
+    [dependencies]
+    sef = "0.1"
+    ```
+  </Step>
+  
+  <Step title="Encode blocks into droplets">
+    Use the encoder to generate fountain-coded droplets from your blocks
+    
+    ```rust
+    use sef::distribution::RobustSoliton;
+    use sef::droplet::{Encoder, EpochParams};
+    
+    let k = 50;
+    let params = EpochParams::new(0, k as u32, [0u8; 32]);
+    let dist = RobustSoliton::new(k, 0.1, 0.05);
+    let encoder = Encoder::new(&params, &dist, &blocks);
+    let droplets = encoder.generate_n(k as u64 * 3);
+    ```
+  </Step>
+  
+  <Step title="Decode and verify">
+    Reconstruct the original blocks using the peeling decoder
+    
+    ```rust
+    use sef::decoder::peeling_decode;
+    
+    let result = peeling_decode(k, &droplets, &verifier);
+    assert!(result.success);
+    ```
+  </Step>
+</Steps>
+
+## Architecture
+
+SeF implements the complete fountain code pipeline:
+
+1. **Block Source** — Read Bitcoin blocks from blk*.dat files or bitcoinkernel
+2. **Epoch Partitioning** — Group blocks into epochs of k blocks
+3. **Symbol Normalization** — Optionally slice variable-length blocks into fixed-size symbols
+4. **Encoding** — Sample degrees from Robust Soliton Distribution and XOR blocks into droplets
+5. **Network/Storage** — Distribute droplets across peer nodes
+6. **Decoding** — Collect droplets and run peeling decoder with Merkle root verification
+7. **Reconstruction** — Recover original blocks from decoded symbols
+
+## Documentation Sections
+
+<CardGroup cols={2}>
+  <Card title="Get Started" icon="rocket" href="/introduction">
+    Learn the basics and get SeF running in your environment
+  </Card>
+  <Card title="Core Concepts" icon="book" href="/concepts/architecture">
+    Understand fountain codes, Robust Soliton Distribution, and the peeling decoder
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/droplet">
+    Complete reference for all modules, types, and functions
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli/overview">
+    Command-line tool documentation for generate, decode, and reconstruct operations
+  </Card>
+</CardGroup>
+
+## Research Foundation
+
+SeF is based on the research paper:
+
+**S. Kadhe, J. Chung, and K. Ramchandran**  
+*"SeF: A Secure Fountain Architecture for Slashing Storage Costs in Blockchains"*  
+arXiv:1906.12140, 2019
+
+[Read the paper →](https://arxiv.org/abs/1906.12140)

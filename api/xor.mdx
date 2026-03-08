@@ -1,0 +1,297 @@
+---
+title: 'xor'
+description: 'Bitwise XOR primitives with adaptive zero-padding for fountain encoding and decoding'
+---
+
+## Overview
+
+The `xor` module provides bitwise XOR operations with adaptive zero-padding for the fountain encoder and decoder pipelines. XOR is the core algebraic operation in LT codes:
+
+- **During encoding**: Each droplet is formed by XORing $d$ source blocks together
+- **During decoding**: The peeling algorithm recovers source blocks by XORing already-recovered blocks out of higher-degree droplets
+
+All functions treat shorter operands as implicitly zero-padded to the length of the longest operand, enabling variable-size Bitcoin blocks to be combined without pre-normalization.
+
+## Functions
+
+### xor_bytes
+
+XORs two byte slices with adaptive zero-padding, returning a new allocation.
+
+<CodeGroup>
+```rust Function Signature
+pub fn xor_bytes(a: &[u8], b: &[u8]) -> Vec<u8>
+```
+
+```rust Example
+use sef::xor::xor_bytes;
+
+let a = vec![0xFF, 0x00];
+let b = vec![0x0F, 0xF0, 0x55];
+let result = xor_bytes(&a, &b);
+
+// 'a' is implicitly padded: [0xFF, 0x00, 0x00]
+assert_eq!(result, vec![0xF0, 0xF0, 0x55]);
+```
+
+```rust XOR Self is Zero
+let data = vec![0xDE, 0xAD, 0xBE, 0xEF];
+let result = xor_bytes(&data, &data);
+assert_eq!(result, vec![0, 0, 0, 0]);
+```
+</CodeGroup>
+
+<ParamField path="a" type="&[u8]" required>
+  First byte slice to XOR
+</ParamField>
+
+<ParamField path="b" type="&[u8]" required>
+  Second byte slice to XOR
+</ParamField>
+
+<ResponseField name="Result" type="Vec<u8>">
+  A new vector of length `max(a.len(), b.len())` containing the XOR result. When slices differ in length, the shorter one is treated as zero-padded
+</ResponseField>
+
+### Padding Behavior
+
+When the input slices have different lengths:
+
+```rust
+let short = vec![0xFF, 0x00];        // 2 bytes
+let long  = vec![0x0F, 0xF0, 0xAA];  // 3 bytes
+
+// Equivalent to:
+// [0xFF, 0x00, 0x00] XOR [0x0F, 0xF0, 0xAA]
+let result = xor_bytes(&short, &long);
+assert_eq!(result, vec![0xF0, 0xF0, 0xAA]);
+```
+
+---
+
+### xor_into
+
+XORs a block into a mutable buffer in place, extending the buffer if the block is longer.
+
+<CodeGroup>
+```rust Function Signature
+pub fn xor_into(buf: &mut Vec<u8>, block: &[u8])
+```
+
+```rust Example
+use sef::xor::xor_into;
+
+let mut buf = vec![0xFF, 0x00];
+let block = vec![0x0F, 0xF0, 0xAA];
+
+xor_into(&mut buf, &block);
+
+// buf is extended to match block length
+assert_eq!(buf, vec![0xF0, 0xF0, 0xAA]);
+```
+
+```rust Accumulation Pattern
+let mut accumulator = Vec::new();
+
+xor_into(&mut accumulator, &[0x12, 0x34]);
+xor_into(&mut accumulator, &[0x56, 0x78, 0x9A]);
+
+// Accumulator grows as needed
+assert_eq!(accumulator, vec![0x44, 0x4C, 0x9A]);
+```
+</CodeGroup>
+
+<ParamField path="buf" type="&mut Vec<u8>" required>
+  Mutable buffer to XOR into. Will be extended if `block` is longer
+</ParamField>
+
+<ParamField path="block" type="&[u8]" required>
+  Byte slice to XOR into the buffer
+</ParamField>
+
+### Behavior
+
+1. **XOR existing bytes**: Each byte in `buf` is XORed with the corresponding byte from `block`
+2. **Extend if needed**: If `block` is longer than `buf`, the surplus bytes are appended verbatim (equivalent to XOR with zero)
+3. **In-place mutation**: No new allocation if `block.len() <= buf.len()`
+
+This grow-on-demand behavior supports the encoder's accumulation loop where the running buffer starts empty and absorbs blocks of varying lengths.
+
+---
+
+### xor_into_fixed
+
+XORs a source slice into a fixed-size destination buffer without resizing.
+
+<CodeGroup>
+```rust Function Signature
+pub fn xor_into_fixed(dst: &mut [u8], src: &[u8]) -> bool
+```
+
+```rust Example
+use sef::xor::xor_into_fixed;
+
+let mut buffer = [0xFF, 0x00, 0xAA, 0x55];
+let source = [0x0F, 0xF0];
+
+let ok = xor_into_fixed(&mut buffer, &source);
+
+assert!(ok);
+assert_eq!(buffer, [0xF0, 0xF0, 0xAA, 0x55]);
+```
+
+```rust Overflow Detection
+let mut buffer = [0xFF, 0x00];
+let too_long = [0x11, 0x22, 0x33];
+
+let ok = xor_into_fixed(&mut buffer, &too_long);
+
+assert!(!ok);  // Returns false when src is longer
+```
+</CodeGroup>
+
+<ParamField path="dst" type="&mut [u8]" required>
+  Fixed-size destination buffer to XOR into
+</ParamField>
+
+<ParamField path="src" type="&[u8]" required>
+  Source slice to XOR into the destination
+</ParamField>
+
+<ResponseField name="Result" type="bool">
+  Returns `true` if the operation succeeded. Returns `false` if `src.len() > dst.len()`, signaling that the droplet payload grew beyond the expected padded length
+</ResponseField>
+
+### Use in Decoding
+
+A `false` return value is a reliable corruption indicator during peeling decode. Callers should treat this as a `VerifyError`-level fault:
+
+```rust
+if !xor_into_fixed(&mut recovered_block, &droplet.payload) {
+    return Err(VerifyError::PayloadOverflow);
+}
+```
+
+---
+
+### xor_blocks
+
+Folds an arbitrary number of byte slices into a single XOR result.
+
+<CodeGroup>
+```rust Function Signature
+pub fn xor_blocks(blocks: &[&[u8]]) -> Vec<u8>
+```
+
+```rust Example
+use sef::xor::xor_blocks;
+
+let a = vec![0xFF, 0x00, 0xAA];
+let b = vec![0x0F, 0xF0];
+let c = vec![0x01, 0x02, 0x03, 0x04];
+
+let result = xor_blocks(&[&a, &b, &c]);
+
+// All blocks zero-padded to length 4:
+// [0xFF, 0x00, 0xAA, 0x00]
+// [0x0F, 0xF0, 0x00, 0x00]
+// [0x01, 0x02, 0x03, 0x04]
+assert_eq!(result, vec![0xF1, 0xF2, 0xA9, 0x04]);
+```
+
+```rust Empty Input
+let result = xor_blocks(&[]);
+assert!(result.is_empty());
+```
+
+```rust Single Block
+let data = vec![0xDE, 0xAD];
+let result = xor_blocks(&[&data]);
+assert_eq!(result, data);
+```
+</CodeGroup>
+
+<ParamField path="blocks" type="&[&[u8]]" required>
+  Slice of byte slice references to XOR together
+</ParamField>
+
+<ResponseField name="Result" type="Vec<u8>">
+  A new vector of length equal to the longest block, or an empty vector if `blocks` is empty. Shorter slices are implicitly zero-padded
+</ResponseField>
+
+### Use in Encoding
+
+This is the primary multi-block XOR used by `Encoder::generate` to form droplet payloads from $d$ source blocks:
+
+```rust
+let source_blocks = vec![&block_0[..], &block_1[..], &block_2[..]];
+let droplet_payload = xor_blocks(&source_blocks);
+```
+
+## Properties
+
+### Mathematical Properties
+
+The XOR operations maintain standard algebraic properties:
+
+- **Commutative**: `xor_bytes(a, b) == xor_bytes(b, a)`
+- **Associative**: `xor_bytes(xor_bytes(a, b), c) == xor_bytes(a, xor_bytes(b, c))`
+- **Identity**: XOR with all-zeros leaves data unchanged
+- **Self-inverse**: `xor_bytes(x, x)` produces all zeros
+
+These properties are preserved even with adaptive padding:
+
+```rust
+let a = vec![0x12];
+let b = vec![0x56, 0x78];
+let c = vec![0x9A, 0xBC, 0xDE];
+
+// Associativity with different lengths
+let ab_c = xor_bytes(&xor_bytes(&a, &b), &c);
+let a_bc = xor_bytes(&a, &xor_bytes(&b, &c));
+assert_eq!(ab_c, a_bc);
+```
+
+## Performance Characteristics
+
+### xor_bytes
+- **Time**: O(max(a.len(), b.len()))
+- **Space**: Allocates new vector of size max(a.len(), b.len())
+- **Use case**: Combining two blocks when neither should be mutated
+
+### xor_into
+- **Time**: O(block.len())
+- **Space**: Only allocates if extension is needed
+- **Use case**: Accumulating multiple blocks into a running buffer
+
+### xor_into_fixed
+- **Time**: O(src.len())
+- **Space**: Zero allocation (in-place mutation only)
+- **Use case**: Peeling decoder where buffer sizes are pre-allocated
+
+### xor_blocks
+- **Time**: O(n * max_len) where n = blocks.len()
+- **Space**: Allocates new vector of size max_len
+- **Use case**: Encoder combining d source blocks into a droplet
+
+## Zero-Padding Rationale
+
+Variable-size blocks are common in Bitcoin fountain encoding:
+
+- **Metadata blocks**: Transaction indices, timestamps (small)
+- **Payload blocks**: Raw transaction data (large, variable)
+- **Partial blocks**: Last block in epoch may be shorter
+
+Adaptive zero-padding eliminates the need for pre-normalization:
+
+```rust
+// Without padding support, you'd need:
+let max_len = a.len().max(b.len());
+let mut a_padded = a.clone();
+let mut b_padded = b.clone();
+a_padded.resize(max_len, 0);
+b_padded.resize(max_len, 0);
+
+// With padding support:
+let result = xor_bytes(&a, &b);  // Just works
+```

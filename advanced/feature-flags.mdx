@@ -1,0 +1,209 @@
+---
+title: Feature Flags
+description: Configuration options for enabling optional dependencies in the SeF library
+---
+
+# Feature Flags
+
+SeF provides optional feature flags to enable additional functionality. Feature flags are configured in your `Cargo.toml` when adding SeF as a dependency.
+
+## Available Features
+
+### `kernel` (Default: Enabled)
+
+Enables the `KernelBlockReader` backed by the `bitcoinkernel` C library for validated block access from a Bitcoin Core data directory.
+
+<Info>
+The `kernel` feature is enabled by default, providing seamless integration with Bitcoin Core's validated blockchain data.
+</Info>
+
+#### What It Does
+
+- Provides access to the [`chain::KernelBlockReader`](https://github.com/abeeujah/sef/blob/main/src/chain/kernel_reader.rs) module
+- Enables reading blocks directly from Bitcoin Core's `blocks/` directory
+- Uses `bitcoinkernel` FFI for validated, index-ordered block access
+- Eliminates manual chain ordering and validation
+- Supports both pruned and full Bitcoin Core datadirs
+
+#### Dependencies Added
+
+When enabled, this feature adds:
+- `bitcoinkernel = "0.1"` — Bitcoin Core's libbitcoinkernel C library bindings
+- `bitcoin = "0.32"` with `std` features (always included)
+
+## Usage Examples
+
+### Default Build (with `kernel`)
+
+By default, the `kernel` feature is enabled:
+
+```toml Cargo.toml
+[dependencies]
+sef = "0.1"
+```
+
+```bash Terminal
+# Build with default features (kernel enabled)
+cargo build --release
+```
+
+<Tip>
+Use the default configuration when working with Bitcoin Core datadirs for automatic block validation and ordering.
+</Tip>
+
+### Building Without `kernel`
+
+To use only the raw `blk*.dat` file parser without `bitcoinkernel` dependency:
+
+```toml Cargo.toml
+[dependencies]
+sef = { version = "0.1", default-features = false }
+```
+
+```bash Terminal
+# Build without default features (no bitcoinkernel)
+cargo build --release --no-default-features
+```
+
+<Warning>
+Without the `kernel` feature, you can only use `BlkFileReader` for parsing raw block files. This reader does not validate blocks or provide canonical chain ordering.
+</Warning>
+
+### Explicit Feature Control
+
+You can explicitly enable or disable features:
+
+```toml Cargo.toml
+# Explicitly enable kernel feature
+[dependencies]
+sef = { version = "0.1", features = ["kernel"] }
+```
+
+## Code Examples
+
+<Accordion title="Using KernelBlockReader (requires kernel feature)">
+```rust
+use sef::chain::KernelBlockReader;
+use bitcoinkernel::ChainType;
+use std::path::Path;
+
+// Create a reader for Bitcoin signet
+let data_dir = Path::new("/home/user/.bitcoin/signet");
+let reader = KernelBlockReader::new(data_dir, ChainType::Signet);
+
+// Iterate over validated blocks in chain order
+reader.for_each_block(&mut |block| {
+    println!("Block {} at height {}", block.hash, block.height);
+    Ok(std::ops::ControlFlow::Continue(()))
+})?;
+```
+</Accordion>
+
+<Accordion title="Using BlkFileReader (no kernel feature required)">
+```rust
+use sef::chain::BlkFileReader;
+use std::path::Path;
+
+// Read raw blk*.dat files without validation
+let blocks_dir = Path::new("/home/user/.bitcoin/signet/blocks");
+let reader = BlkFileReader::new(blocks_dir)?;
+
+// Iterate over raw blocks (file order, not chain order)
+reader.for_each_block(&mut |block| {
+    println!("Block: {}", block.hash);
+    Ok(std::ops::ControlFlow::Continue(()))
+})?;
+```
+
+<Note>
+`BlkFileReader` processes blocks in the order they appear in `blk*.dat` files, which may not match canonical chain order. Use `KernelBlockReader` for validated, height-ordered iteration.
+</Note>
+</Accordion>
+
+## When to Use Each Configuration
+
+| Scenario | Recommended Configuration | Rationale |
+|----------|---------------------------|----------|
+| **Production fountain encoding from Bitcoin Core** | Default (`kernel` enabled) | Automatic validation, canonical ordering, supports pruned nodes |
+| **Development/testing with raw block files** | `--no-default-features` | Lighter dependencies, faster compilation |
+| **Embedded systems with size constraints** | `--no-default-features` | Smaller binary size (no C library FFI) |
+| **Custom block source/format** | `--no-default-features` | Implement your own `BlockSource` trait |
+
+## Compilation Impact
+
+<Accordion title="Build Time Comparison">
+
+**With `kernel` feature (default):**
+- Compiles `bitcoinkernel` C library bindings
+- Requires C compiler toolchain
+- Initial build: ~2-3 minutes (depending on hardware)
+- Incremental builds: ~10-30 seconds
+
+**Without `kernel` feature:**
+- Pure Rust compilation only
+- No external C dependencies
+- Initial build: ~1-2 minutes
+- Incremental builds: ~5-15 seconds
+
+</Accordion>
+
+## Binary Size Impact
+
+The `kernel` feature adds approximately:
+- **Linux x86_64:** ~2-3 MB to binary size
+- **macOS ARM64:** ~2.5-3.5 MB to binary size
+
+This includes the `bitcoinkernel` C library and its Bitcoin Core validation logic.
+
+## Troubleshooting
+
+<Accordion title="Error: bitcoinkernel dependency failed to build">
+
+**Symptom:** Build fails with linker errors related to `bitcoinkernel`
+
+**Solution:**
+```bash
+# Option 1: Install required C/C++ build tools
+sudo apt install build-essential  # Debian/Ubuntu
+brew install gcc                  # macOS
+
+# Option 2: Build without kernel feature
+cargo build --no-default-features
+```
+
+</Accordion>
+
+<Accordion title="Error: 'kernel' feature required for this example">
+
+**Symptom:** Code using `KernelBlockReader` fails to compile
+
+**Solution:** Ensure the `kernel` feature is enabled (default) or use `BlkFileReader` instead:
+
+```rust
+// Replace this:
+use sef::chain::KernelBlockReader;
+
+// With this:
+use sef::chain::BlkFileReader;
+```
+
+</Accordion>
+
+## Future Features
+
+The SeF architecture is designed to support additional optional features:
+
+- **Network transport** — P2P droplet exchange protocol
+- **Storage backends** — Alternative serialization formats (Parquet, Arrow)
+- **Compression** — zstd/lz4 droplet payload compression
+- **GPU acceleration** — CUDA/OpenCL for parallel XOR operations
+
+<Tip>
+Check the [GitHub repository](https://github.com/abeeujah/sef) for the latest feature flag additions and roadmap updates.
+</Tip>
+
+## Related Documentation
+
+- [Performance Tuning](/advanced/performance) — Optimize encoding/decoding parameters
+- [Troubleshooting](/advanced/troubleshooting) — Common errors and solutions
+- [Architecture Overview](/concepts/architecture) — Understanding SeF's design

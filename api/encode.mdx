@@ -1,0 +1,166 @@
+---
+title: 'encode'
+description: 'Binary serialization and filesystem I/O for fountain-encoded droplets'
+---
+
+## Overview
+
+The `encode` module provides binary serialization of `Droplet` structures using Bitcoin consensus encoding. Serialized droplets use Bitcoin's `VarInt` length-prefixed format for compact on-disk and on-wire representation suitable for storage and network transfer.
+
+## Serialization Format
+
+Droplets are encoded using the following wire format:
+
+```text
+epoch_id (u64) || droplet_id (u64) || num_indices (VarInt) || indices (u32 each)
+|| padded_len (u32) || payload_len (VarInt) || payload (bytes)
+```
+
+This format produces compact, self-describing binary streams that can be safely transmitted over networks or stored to disk.
+
+## Functions
+
+### write_droplet_file
+
+Consensus-serializes a `Droplet` and writes the resulting bytes atomically to the specified path.
+
+<CodeGroup>
+```rust Function Signature
+pub fn write_droplet_file(
+    path: &std::path::Path,
+    droplet: &Droplet
+) -> io::Result<()>
+```
+
+```rust Example
+use sef::encode::write_droplet_file;
+use sef::droplet::Droplet;
+use std::path::Path;
+
+let droplet = Droplet {
+    epoch_id: 42,
+    droplet_id: 7,
+    indices: vec![3, 15, 99],
+    padded_len: 8,
+    payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+};
+
+let path = Path::new("epoch_42_droplet_7.bin");
+write_droplet_file(&path, &droplet)?;
+```
+</CodeGroup>
+
+<ParamField path="path" type="&std::path::Path" required>
+  File system path where the serialized droplet will be written
+</ParamField>
+
+<ParamField path="droplet" type="&Droplet" required>
+  Reference to the droplet structure to serialize and write
+</ParamField>
+
+<ResponseField name="Result" type="io::Result<()>">
+  Returns `Ok(())` on success, or an `io::Error` if the write operation fails
+</ResponseField>
+
+---
+
+### read_droplet_file
+
+Reads raw bytes from the specified path and consensus-deserializes them into a `Droplet`.
+
+<CodeGroup>
+```rust Function Signature
+pub fn read_droplet_file(
+    path: &std::path::Path
+) -> io::Result<Droplet>
+```
+
+```rust Example
+use sef::encode::read_droplet_file;
+use std::path::Path;
+
+let path = Path::new("epoch_42_droplet_7.bin");
+let droplet = read_droplet_file(&path)?;
+
+println!("Epoch: {}, Droplet: {}", droplet.epoch_id, droplet.droplet_id);
+println!("Indices: {:?}", droplet.indices);
+```
+</CodeGroup>
+
+<ParamField path="path" type="&std::path::Path" required>
+  File system path to read the serialized droplet from
+</ParamField>
+
+<ResponseField name="Result" type="io::Result<Droplet>">
+  Returns the deserialized `Droplet` on success. Returns an `io::Error` with kind `io::ErrorKind::InvalidData` if the byte stream does not represent a valid droplet
+</ResponseField>
+
+---
+
+### droplet_filename
+
+Produces the canonical filename for a droplet based on its epoch and droplet identifiers.
+
+<CodeGroup>
+```rust Function Signature
+pub fn droplet_filename(
+    epoch_id: u64,
+    droplet_id: u64
+) -> String
+```
+
+```rust Example
+use sef::encode::droplet_filename;
+
+let filename = droplet_filename(5, 42);
+assert_eq!(filename, "epoch_5_droplet_42.bin");
+```
+</CodeGroup>
+
+<ParamField path="epoch_id" type="u64" required>
+  The epoch identifier
+</ParamField>
+
+<ParamField path="droplet_id" type="u64" required>
+  The droplet identifier within the epoch
+</ParamField>
+
+<ResponseField name="Result" type="String">
+  Returns a string in the format `epoch_{epoch_id}_droplet_{droplet_id}.bin`
+</ResponseField>
+
+## Wire Format Details
+
+The binary encoding uses Bitcoin's consensus encoding primitives:
+
+- **Fixed-size integers** (`u32`, `u64`): Little-endian encoding
+- **VarInt**: Compact variable-length integer encoding (1-9 bytes)
+- **Vector encoding**: `VarInt` length prefix followed by elements
+
+This format ensures:
+- **Compact representation**: VarInt encoding minimizes overhead for small vectors
+- **Self-describing**: Length prefixes allow streaming deserialization
+- **Cross-platform compatibility**: Fixed endianness and deterministic encoding
+- **Robust parsing**: Length limits prevent memory exhaustion attacks
+
+## Error Handling
+
+### write_droplet_file
+
+Can fail with `io::Error` for standard filesystem errors:
+- Permission denied
+- Disk full
+- Invalid path
+- Parent directory doesn't exist
+
+### read_droplet_file
+
+Can fail with `io::Error` for:
+- File not found
+- Permission denied
+- **Invalid data**: Corrupted or truncated droplet files return `io::ErrorKind::InvalidData`
+
+## Dependencies
+
+- **bitcoin**: Provides `VarInt` and consensus encoding primitives
+- **crate::droplet**: Defines the `Droplet` structure

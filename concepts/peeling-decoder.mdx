@@ -1,0 +1,416 @@
+---
+title: "Peeling Decoder"
+description: "How the LT peeling decoder recovers source blocks, the ripple mechanism, and verification strategies"
+---
+
+The **peeling decoder** is the algorithm that reconstructs the original k source blocks from a collection of droplets. It operates on the bipartite graph between droplets and source blocks, iteratively resolving singletons until all blocks are recovered or the ripple is exhausted.
+
+## The Peeling Process
+
+The decoder maintains a **ripple** — a queue of degree-1 droplets (singletons) that can be immediately processed.
+
+<Steps>
+  <Step title="Initialize the ripple">
+    Scan all droplets and add any singletons to the queue.
+
+    ```rust
+    let mut queue: VecDeque<usize> = VecDeque::new();
+    for di in 0..remaining_degree.len() {
+        if remaining_degree[di] == 1 {
+            queue.push_back(di);
+        }
+    }
+    ```
+    Source: `src/decoder.rs:431`
+  </Step>
+
+  <Step title="Pop a singleton from the ripple">
+    The singleton's payload is the raw source block (no XOR needed).
+
+    ```rust
+    while let Some(di) = queue.pop_front() {
+        if remaining_degree[di] != 1 {
+            continue;
+        }
+        let block_idx = xor_index[di];
+    ```
+    Source: `src/decoder.rs:443`
+  </Step>
+
+  <Step title="Verify the recovered block">
+    Pass the payload to the `BlockVerifier` to check integrity.
+
+    ```rust
+    let candidate = std::mem::take(&mut droplet_payloads[di]);
+    match verifier.verify_and_len(block_idx, &candidate) {
+        Ok(true_len) => {
+            // Block is valid, proceed to peeling
+        }
+        Err(_e) => {
+            // Block failed verification, disable droplet
+            droplet_disabled[di] = true;
+            verify_failures += 1;
+        }
+    }
+    ```
+    Source: `src/decoder.rs:454`
+  </Step>
+
+  <Step title="Peel the block out of all droplets">
+    XOR the recovered block out of every other droplet that references it.
+
+    ```rust
+    if let Some(referencing) = block_to_droplets.remove(&block_idx) {
+        for ref_di in referencing {
+            xor::xor_into_fixed(&mut droplet_payloads[ref_di], &block_bytes);
+            remaining_degree[ref_di] -= 1;
+            xor_index[ref_di] ^= block_idx;
+
+            if remaining_degree[ref_di] == 1 {
+                queue.push_back(ref_di);
+            }
+        }
+    }
+    ```
+    Source: `src/decoder.rs:467`
+  </Step>
+
+  <Step title="Repeat until done">
+    Continue processing singletons until the ripple is empty or all k blocks are recovered.
+  </Step>
+</Steps>
+
+<Info>
+The decoder uses an XOR index trick: `xor_index[di] = idx₀ ⊕ idx₁ ⊕ ... ⊕ idxₙ`. When the degree drops to 1, `xor_index[di]` holds the surviving block index.
+</Info>
+
+## Ripple Concept
+
+The **ripple** is the set of degree-1 droplets available at each decoding step. It acts as a "wavefront" that propagates through the bipartite graph.
+
+### Ripple Evolution
+
+```
+Initial state:
+  Droplet 0: [0]          ← singleton (in ripple)
+  Droplet 1: [0, 1, 2]
+  Droplet 2: [1, 3]
+  Droplet 3: [2, 3]
+
+After peeling block 0:
+  Droplet 1: [1, 2]       (degree reduced from 3 to 2)
+  Droplet 2: [1, 3]
+  Droplet 3: [2, 3]
+  Ripple: empty           ← stalled!
+
+With better droplets:
+  Droplet 0: [0]          ← process this
+  Droplet 1: [0, 1]
+  Droplet 2: [1, 2]
+  Droplet 3: [2, 3]
+
+After peeling block 0:
+  Droplet 1: [1]          ← new singleton! add to ripple
+  Droplet 2: [1, 2]
+  Droplet 3: [2, 3]
+
+After peeling block 1:
+  Droplet 2: [2]          ← new singleton!
+  Droplet 3: [2, 3]
+
+After peeling block 2:
+  Droplet 3: [3]          ← new singleton!
+
+After peeling block 3:
+  All blocks recovered!
+```
+
+<Note>
+The Robust Soliton Distribution is specifically designed to maintain approximately S singletons in the ripple at all times, preventing stalls.
+</Note>
+
+## Graph-Only Simulation
+
+For testing recoverability without processing payloads, use `peeling_check`:
+
+```rust
+pub fn peeling_check(k: usize, droplets: &[Vec<u32>]) -> PeelResult {
+    // Lightweight graph simulation (no XOR operations)
+    // Returns success/failure and statistics
+}
+```
+Source: `src/decoder.rs:73`
+
+### Example: Verifying Coverage
+
+```rust
+use sef::decoder::peeling_check;
+
+// Three singletons covering all blocks
+let droplets = vec![vec![0], vec![1], vec![2]];
+let result = peeling_check(3, &droplets);
+assert!(result.success);
+assert_eq!(result.decoded, 3);
+
+// Chain peeling: [0] → [0,1] → [1,2]
+let droplets = vec![vec![0], vec![0, 1], vec![1, 2]];
+let result = peeling_check(3, &droplets);
+assert!(result.success);
+
+// Insufficient droplets
+let droplets = vec![vec![0, 1], vec![1, 2]]; // no singletons
+let result = peeling_check(3, &droplets);
+assert!(!result.success);
+assert_eq!(result.decoded, 0);
+```
+
+<Accordion title="When does peeling_check fail?">
+The check fails when:
+
+1. **No initial singletons:** Every droplet has degree ≥ 2
+2. **Ripple collapse:** The ripple empties before all blocks are recovered
+3. **Insufficient coverage:** Some blocks are never referenced by any droplet
+
+This can happen due to:
+- Too few droplets (n < k)
+- Bad random sampling (unlikely with proper RSD)
+- Adversarial droplet selection
+</Accordion>
+
+## Full Payload Decoding
+
+For actual reconstruction with verification, use `peeling_decode`:
+
+```rust
+pub fn peeling_decode(
+    k: usize,
+    droplets: Vec<Droplet>,
+    verifier: &dyn BlockVerifier,
+) -> DecodeResult
+```
+Source: `src/decoder.rs:391`
+
+### DecodeResult Structure
+
+```rust
+pub struct DecodeResult {
+    /// Reconstructed blocks (None for unsolved)
+    pub blocks: Vec<Option<Vec<u8>>>,
+
+    /// Total source blocks (K)
+    pub k: usize,
+
+    /// Successfully recovered count
+    pub decoded_count: usize,
+
+    /// Peeling steps performed
+    pub iterations: usize,
+
+    /// Droplets rejected by verifier
+    pub verify_failures: usize,
+
+    /// Why decoding stopped
+    pub stop_reason: DecodeStopReason,
+
+    /// Details on failed blocks
+    pub failures: Vec<BlockFailure>,
+}
+```
+Source: `src/decoder.rs:307`
+
+## Block Verification
+
+The `BlockVerifier` trait enables pluggable verification strategies:
+
+```rust
+pub trait BlockVerifier {
+    /// Validates candidate and returns true byte length
+    fn verify_and_len(&self, block_idx: u32, candidate: &[u8])
+        -> Result<usize, VerifyError>;
+}
+```
+Source: `src/decoder.rs:186`
+
+### Bitcoin Block Verifier
+
+Verifies blocks by comparing double-SHA256 hashes against the header chain:
+
+```rust
+pub struct BitcoinBlockVerifier {
+    pub expected_hashes: Vec<bitcoin::BlockHash>,
+}
+
+impl BlockVerifier for BitcoinBlockVerifier {
+    fn verify_and_len(&self, block_idx: u32, candidate: &[u8])
+        -> Result<usize, VerifyError>
+    {
+        let (block, used): (bitcoin::Block, usize) =
+            deserialize_partial(candidate)
+                .map_err(|e| VerifyError::Deserialize(e.to_string()))?;
+
+        let hash = block.block_hash();
+        let expected = &self.expected_hashes[block_idx as usize];
+
+        if hash != *expected {
+            return Err(VerifyError::HashMismatch { /* ... */ });
+        }
+
+        // Check for non-zero padding
+        if candidate[used..].iter().any(|&b| b != 0) {
+            return Err(VerifyError::NonZeroPadding);
+        }
+
+        Ok(used)
+    }
+}
+```
+Source: `src/decoder.rs:214`
+
+<Warning>
+The verifier returns the **true byte length** before padding. The decoder uses this to truncate the recovered payload to its original size.
+</Warning>
+
+### Symbol Verifier
+
+For symbol-mode decoding, use SHA-256 hashes of fixed-size symbols:
+
+```rust
+pub struct SymbolVerifier<'a> {
+    pub symbol_size: usize,
+    pub symbol_hashes: &'a [[u8; 32]],
+}
+
+impl BlockVerifier for SymbolVerifier<'_> {
+    fn verify_and_len(&self, block_idx: u32, candidate: &[u8])
+        -> Result<usize, VerifyError>
+    {
+        let expected = self.symbol_hashes[block_idx as usize];
+        let got: [u8; 32] = Sha256::new()
+            .chain_update(candidate)
+            .finalize()
+            .into();
+
+        if got != expected {
+            return Err(VerifyError::HashMismatch { /* ... */ });
+        }
+
+        Ok(self.symbol_size)
+    }
+}
+```
+Source: `src/decoder.rs:249`
+
+## Handling Murky Droplets
+
+In adversarial settings, some nodes may supply **murky droplets** (maliciously formed). The verifier detects these:
+
+```rust
+match verifier.verify_and_len(block_idx, &candidate) {
+    Ok(true_len) => {
+        // Valid block, proceed with peeling
+    }
+    Err(_e) => {
+        // Murky droplet detected
+        droplet_disabled[di] = true;
+        verify_failures += 1;
+        // Continue without this droplet
+    }
+}
+```
+Source: `src/decoder.rs:491`
+
+<Info>
+The decoder does NOT propagate errors: if a murky droplet is detected, it's disabled and the decoder continues. This prevents a single adversarial node from poisoning the entire reconstruction.
+</Info>
+
+## Example: Round-Trip Encode/Decode
+
+```rust
+use sef::distribution::RobustSoliton;
+use sef::droplet::{Encoder, EpochParams};
+use sef::decoder::{peeling_decode, BlockVerifier, VerifyError};
+
+// Create test data
+let k = 20;
+let blocks: Vec<Vec<u8>> = (0..k)
+    .map(|i| vec![(i & 0xFF) as u8; 256])
+    .collect();
+
+// Encode
+let params = EpochParams::new(0, k as u32, [42u8; 32]);
+let dist = RobustSoliton::new(k, 0.1, 0.5);
+let encoder = Encoder::new(&params, &dist, &blocks);
+let droplets = encoder.generate_n((k as u64) * 5);
+
+// Simple verifier for testing
+struct ExactVerifier { expected: Vec<Vec<u8>> }
+impl BlockVerifier for ExactVerifier {
+    fn verify_and_len(&self, block_idx: u32, candidate: &[u8])
+        -> Result<usize, VerifyError>
+    {
+        let expected = &self.expected[block_idx as usize];
+        if candidate[..expected.len()] == expected[..] {
+            Ok(expected.len())
+        } else {
+            Err(VerifyError::Deserialize("mismatch".into()))
+        }
+    }
+}
+
+// Decode
+let verifier = ExactVerifier { expected: blocks.clone() };
+let result = peeling_decode(k, droplets, &verifier);
+
+assert!(result.is_success());
+for (i, block) in result.blocks.iter().enumerate() {
+    assert_eq!(block.as_ref().unwrap(), &blocks[i]);
+}
+```
+
+## Failure Analysis
+
+When decoding fails, the `DecodeResult` provides detailed diagnostics:
+
+```rust
+pub struct BlockFailure {
+    /// Block index that was not recovered
+    pub index: u32,
+
+    /// Residual degree: droplets still referencing this block
+    pub referenced_by: usize,
+}
+```
+Source: `src/decoder.rs:292`
+
+A `referenced_by` value of 0 means the block was never covered by any droplet.
+
+<Accordion title="Interpreting DecodeStopReason">
+```rust
+pub enum DecodeStopReason {
+    /// All k blocks recovered successfully
+    Completed,
+
+    /// Ripple collapsed before all blocks recovered
+    Stalled,
+}
+```
+Source: `src/decoder.rs:282`
+
+- `Completed`: Success! All blocks decoded and verified.
+- `Stalled`: The ripple is empty but some blocks remain unsolved. This means the current set of droplets is insufficient. Request more droplets and retry.
+</Accordion>
+
+## Performance Characteristics
+
+- **Best case:** O(k) peeling steps when droplets form a perfect chain
+- **Average case:** O(k log k) with Robust Soliton Distribution
+- **Worst case:** O(k²) when every block triggers full graph scan
+
+<Note>
+The decoder's main bottleneck is XOR operations on large payloads. Using symbol mode with fixed-size symbols (typically 4 KiB) significantly improves cache locality.
+</Note>
+
+## References
+
+- Section III.C of the [SeF paper](https://arxiv.org/abs/1906.12140) describes the error-resilient peeling decoder
+- M. Luby, *"LT Codes"*, Proc. 43rd IEEE FOCS, 2002, introduces the peeling algorithm

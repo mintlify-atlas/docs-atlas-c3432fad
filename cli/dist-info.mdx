@@ -1,0 +1,269 @@
+---
+title: sef dist-info
+description: Show Robust Soliton Distribution statistics and degree probabilities
+---
+
+## Synopsis
+
+```bash
+sef dist-info [OPTIONS]
+```
+
+## Description
+
+Computes and displays statistics for the Robust Soliton Distribution (RSD) with the specified parameters. The RSD is used to sample droplet degrees during fountain encoding.
+
+The command shows:
+- Expected degree E[d]
+- Degree distribution (probability mass function)
+- Top 10 most frequent degrees from sampling
+
+This is useful for:
+- Understanding how parameters affect the degree distribution
+- Tuning `c` and `delta` for optimal performance
+- Visualizing the distribution before encoding
+
+<Note>
+  The Robust Soliton Distribution is a modified version of the Ideal Soliton Distribution that adds robustness against decoding failures. See [Luby 2002](https://dl.acm.org/doi/10.5555/509907.509909) for details.
+</Note>
+
+## Options
+
+<ParamField path="k" type="integer" default="1000">
+  Epoch size — number of source blocks/symbols.
+  
+  This is the same `k` parameter used in [`generate`](/cli/generate) and other commands.
+  
+  **Short flag:** `-k`
+  
+  **Example:** `--k 100`
+</ParamField>
+
+<ParamField path="c" type="float" default="0.1">
+  Robust Soliton parameter c — tuning constant.
+  
+  Controls the spike at degree 1. Higher values flatten the distribution.
+  
+  **Short flag:** `-c`
+  
+  **Typical range:** 0.01–0.5
+</ParamField>
+
+<ParamField path="delta" type="float" default="0.05">
+  Robust Soliton parameter delta — failure probability.
+  
+  Lower values increase the expected degree (more robust, higher overhead).
+  
+  **Short flag:** `-d`
+  
+  **Typical range:** 0.01–0.1
+</ParamField>
+
+## Examples
+
+### Basic Usage
+
+<CodeGroup>
+
+```bash Default parameters
+sef dist-info --k 1000 --c 0.1 --delta 0.05
+```
+
+```bash Small epoch
+sef dist-info --k 100 --c 0.1 --delta 0.05
+```
+
+```bash High reliability
+sef dist-info --k 100 --c 0.05 --delta 0.01
+```
+
+```bash Low overhead
+sef dist-info --k 100 --c 0.2 --delta 0.1
+```
+
+</CodeGroup>
+
+### Example Output
+
+```
+Robust Soliton Distribution
+  k (epoch size): 1000
+  c:              0.1
+  delta:          0.05
+  E[degree]:      11.42
+
+  Degree distribution (top 10 most frequent):
+    d=   1:  3421 (34.2%)
+    d=   2:  1789 (17.9%)
+    d=   3:   987 (9.9%)
+    d=  11:   654 (6.5%)
+    d=  10:   602 (6.0%)
+    d=  12:   571 (5.7%)
+    d=   9:   489 (4.9%)
+    d=   4:   412 (4.1%)
+    d=  13:   398 (4.0%)
+    d=   8:   287 (2.9%)
+```
+
+## Understanding the Output
+
+### Expected Degree E[d]
+
+The average number of source symbols XOR'd into each droplet.
+
+```
+E[d] = Σ(d × P(d))  for d = 1 to k
+```
+
+**Interpretation:**
+- **Higher E[d]:** More robust decoding, but slower encoding/decoding
+- **Lower E[d]:** Faster encoding/decoding, but less robust
+
+Typical values:
+- `k=100`, `c=0.1`, `δ=0.05`: E[d] ≈ 4–5
+- `k=1000`, `c=0.1`, `δ=0.05`: E[d] ≈ 11–12
+
+The expected degree grows as `O(ln(k/δ) × √k)` per the SeF paper.
+
+### Degree Distribution
+
+The probability mass function showing how often each degree appears.
+
+Key observations:
+- **Large spike at d=1:** Critical for the peeling decoder to start
+- **Secondary spike around d≈√k:** Provided by the robust component
+- **Long tail:** Rare high-degree droplets connect distant symbols
+
+<Tip>
+  A healthy distribution has 30–40% degree-1 droplets. If this drops below 20%, increase `c` or decrease `delta`.
+</Tip>
+
+## Parameter Effects
+
+### Increasing `k` (Epoch Size)
+
+```bash
+sef dist-info --k 100 --c 0.1 --delta 0.05   # E[d] ≈ 4.5
+sef dist-info --k 1000 --c 0.1 --delta 0.05  # E[d] ≈ 11.4
+sef dist-info --k 10000 --c 0.1 --delta 0.05 # E[d] ≈ 36.2
+```
+
+**Effect:** Higher `k` increases E[d] and spreads the distribution.
+
+**Trade-off:** Larger epochs improve compression but require more droplets for recovery.
+
+### Increasing `c` (Tuning Constant)
+
+```bash
+sef dist-info --k 100 --c 0.05 --delta 0.05  # E[d] ≈ 5.2
+sef dist-info --k 100 --c 0.1 --delta 0.05   # E[d] ≈ 4.5
+sef dist-info --k 100 --c 0.5 --delta 0.05   # E[d] ≈ 3.1
+```
+
+**Effect:** Higher `c` flattens the distribution (more uniform degrees).
+
+**Trade-off:** Lower `c` increases robustness but also increases E[d] (slower).
+
+### Decreasing `delta` (Failure Probability)
+
+```bash
+sef dist-info --k 100 --c 0.1 --delta 0.1    # E[d] ≈ 4.0
+sef dist-info --k 100 --c 0.1 --delta 0.05   # E[d] ≈ 4.5
+sef dist-info --k 100 --c 0.1 --delta 0.01   # E[d] ≈ 5.8
+```
+
+**Effect:** Lower `delta` increases E[d] (more robust).
+
+**Trade-off:** Lower failure probability requires more overhead.
+
+## Use Cases
+
+### Parameter Tuning
+
+Experiment with different parameters before encoding:
+
+```bash
+# Goal: Minimize E[d] while maintaining reliability
+
+# Baseline
+sef dist-info --k 100 --c 0.1 --delta 0.05
+# E[d] ≈ 4.5
+
+# Try higher c (flatten distribution)
+sef dist-info --k 100 --c 0.3 --delta 0.05
+# E[d] ≈ 3.2 (faster, but less robust)
+
+# Validate with reconstruct
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --k 100 --c 0.3 --delta 0.05
+```
+
+### Understanding Overhead
+
+Relate E[d] to encoding/decoding performance:
+
+```bash
+# High E[d] configuration
+sef dist-info --k 100 --c 0.05 --delta 0.01
+# E[d] ≈ 6.5
+# Expected: High reliability, slower XOR operations
+
+# Low E[d] configuration
+sef dist-info --k 100 --c 0.5 --delta 0.1
+# E[d] ≈ 2.8
+# Expected: Lower reliability, faster XOR operations
+```
+
+### Visualizing Distribution Shape
+
+Check if the distribution has the expected properties:
+
+```bash
+sef dist-info --k 100 --c 0.1 --delta 0.05
+```
+
+**Expected:**
+- Strong spike at d=1 (30–40%)
+- Secondary concentration around d≈10
+- Smooth falloff to higher degrees
+
+**Red flags:**
+- &lt;20% degree-1 droplets: Decoding may stall
+- Very high E[d] (&gt;10 for k=100): Encoding will be slow
+
+## Theoretical Background
+
+### Ideal Soliton Distribution
+
+The ideal distribution for fountain codes:
+
+```
+ρ(1) = 1/k
+ρ(d) = 1/(d(d-1))  for d = 2, 3, ..., k
+```
+
+Provides optimal decoding on the Binary Erasure Channel but is fragile in practice.
+
+### Robust Soliton Distribution
+
+Adds a robust component τ(d) to ρ(d):
+
+```
+τ(d) = (c · ln(k/δ) / k) / d     for d = 1, ..., k/(c·ln(k/δ)) - 1
+τ(d) = c · ln(k/δ) / k           at d = k/(c·ln(k/δ))
+τ(d) = 0                         otherwise
+
+μ(d) = ρ(d) + τ(d)
+β(d) = μ(d) / Σμ                 (normalized)
+```
+
+This produces a degree-1 spike and a secondary spike around k/R where R = c·ln(k/δ).
+
+<Note>
+  For detailed derivations, see M. Luby, "LT Codes," *Proc. 43rd IEEE FOCS*, 2002.
+</Note>
+
+## See Also
+
+- [`sef generate`](/cli/generate) — Use these parameters to encode blocks
+- [`sef reconstruct`](/cli/reconstruct) — Test parameters end-to-end
+- [`sef experiment`](/cli/experiment) — Measure success rates for parameter combinations

@@ -1,0 +1,179 @@
+---
+title: 'Encoder'
+description: 'Generate fountain-coded droplets from source blocks'
+---
+
+## Overview
+
+The `Encoder` generates LT-code droplets from a fixed set of source blocks using deterministic encoding. It borrows all inputs (zero-copy) and is parameterized over any `DegreeDistribution`.
+
+## Encoder
+
+```rust
+pub struct Encoder<'e, D: DegreeDistribution> {
+    params: &'e EpochParams,
+    dist: &'e D,
+    blocks: &'e [Vec<u8>],
+}
+```
+
+An LT-code encoder that generates `Droplet`s from a fixed set of source blocks.
+
+<Expandable title="Type Parameters">
+  <ResponseField name="'e" type="lifetime">
+    Lifetime of borrowed epoch parameters, distribution, and source blocks
+  </ResponseField>
+
+  <ResponseField name="D" type="DegreeDistribution">
+    The degree distribution implementation (typically `RobustSoliton`)
+  </ResponseField>
+</Expandable>
+
+---
+
+## Methods
+
+### new
+
+```rust
+pub fn new(
+    params: &'e EpochParams,
+    dist: &'e D,
+    blocks: &'e [Vec<u8>]
+) -> Self
+```
+
+Creates a new encoder over the given source blocks.
+
+<ParamField path="params" type="&EpochParams" required>
+  Configuration and root seed for this encoding session
+</ParamField>
+
+<ParamField path="dist" type="&D" required>
+  The probability distribution used to sample the degree for each new droplet
+</ParamField>
+
+<ParamField path="blocks" type="&[Vec<u8>]" required>
+  The source data split into $K$ blocks. If blocks are non-uniform in length, they are implicitly zero-padded to the maximum block size during XOR operations.
+</ParamField>
+
+**Panics:**
+
+Panics if `blocks.len() != params.k`.
+
+**Example:**
+
+```rust
+use sef::distribution::RobustSoliton;
+use sef::droplet::{EpochParams, Encoder};
+
+let k = 8;
+let blocks: Vec<Vec<u8>> = (0..k).map(|i| vec![i as u8; 32]).collect();
+let params = EpochParams::new(0, k as u32, [0u8; 32]);
+let rsd = RobustSoliton::new(k, 0.1, 0.5);
+let encoder = Encoder::new(&params, &rsd, &blocks);
+```
+
+---
+
+### generate
+
+```rust
+pub fn generate(&self, droplet_id: u64) -> Droplet
+```
+
+Generates a single `Droplet` for a specific `droplet_id`.
+
+<ParamField path="droplet_id" type="u64" required>
+  Unique identifier for this droplet within the epoch. Used to derive the deterministic PRNG seed.
+</ParamField>
+
+This process follows the standard LT-code encoding pipeline:
+
+1. Seed a PRNG with domain separation (epoch + droplet)
+2. Sample a degree $d$ from the `DegreeDistribution`
+3. Randomly select $d$ unique source block indices
+4. XOR the selected blocks together to form the droplet payload
+
+The resulting `Droplet` is stateless and can be generated independently of any other droplets in the same epoch.
+
+<ResponseField name="Return" type="Droplet">
+  A fountain-coded droplet containing the XOR of $d$ source blocks
+</ResponseField>
+
+**Example:**
+
+```rust
+use sef::distribution::RobustSoliton;
+use sef::droplet::{EpochParams, Encoder};
+
+let k = 10;
+let blocks: Vec<Vec<u8>> = (0..k).map(|i| vec![i as u8; 64]).collect();
+let params = EpochParams::new(0, k as u32, [0u8; 32]);
+let rsd = RobustSoliton::new(k, 0.1, 0.5);
+
+let encoder = Encoder::new(&params, &rsd, &blocks);
+let droplet = encoder.generate(0);
+assert!(droplet.validate(k as u32).is_ok());
+```
+
+---
+
+### generate_n
+
+```rust
+pub fn generate_n(&self, n: u64) -> Vec<Droplet>
+```
+
+Convenience wrapper that generates `n` droplets with sequential IDs `0..n` via repeated calls to `generate`.
+
+<ParamField path="n" type="u64" required>
+  Number of droplets to generate
+</ParamField>
+
+<ResponseField name="Return" type="Vec<Droplet>">
+  Vector of `n` droplets with IDs from 0 to n-1
+</ResponseField>
+
+**Example:**
+
+```rust
+use sef::distribution::RobustSoliton;
+use sef::droplet::{EpochParams, Encoder};
+
+let k = 50;
+let blocks: Vec<Vec<u8>> = (0..k).map(|i| vec![i as u8; 32]).collect();
+let params = EpochParams::new(0, k as u32, [0u8; 32]);
+let dist = RobustSoliton::new(k, 0.1, 0.5);
+
+let encoder = Encoder::new(&params, &dist, &blocks);
+let droplets = encoder.generate_n(200);
+
+assert_eq!(droplets.len(), 200);
+for (id, d) in droplets.iter().enumerate() {
+    assert_eq!(d.droplet_id, id as u64);
+    assert!(d.validate(k as u32).is_ok());
+}
+```
+
+---
+
+## Deterministic Encoding
+
+The encoder uses SHA-256 for domain separation when deriving per-droplet PRNG seeds:
+
+```
+seed = SHA256(epoch_seed || b"droplet" || epoch_id || droplet_id)
+```
+
+This ensures that:
+- Any peer with the same `EpochParams` can independently reproduce the encoding graph
+- Different droplets have independent, uncorrelated random sampling
+- The encoding is verifiable without transmitting the graph structure out-of-band
+
+## Performance Characteristics
+
+- **Zero-copy:** Encoder borrows all inputs; no allocations during construction
+- **Per-droplet cost:** $O(d)$ where $d$ is the sampled degree
+- **Expected degree:** For `RobustSoliton`, typically $O(\ln(K/\delta))$
+- **Memory usage:** $O(K \cdot \text{block_size})$ for source blocks

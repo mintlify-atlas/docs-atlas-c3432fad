@@ -1,0 +1,409 @@
+---
+title: "Bitcoin Blockchain Integration"
+description: "Read Bitcoin blocks from disk and encode them using fountain codes with BlkFileReader and KernelBlockReader"
+---
+
+## Overview
+
+SeF provides two backend implementations for reading Bitcoin blocks from disk:
+
+- **`BlkFileReader`** - Reads raw `blk*.dat` files directly, handling XOR obfuscation
+- **`KernelBlockReader`** - Uses `bitcoinkernel` FFI for validated, index-ordered block access
+
+Both implement the `BlockSource` trait for streaming block access with O(epoch_size) memory.
+
+## Using BlkFileReader
+
+<Note>
+  `BlkFileReader` handles Bitcoin Core v28+ XOR obfuscation automatically by reading the `xor.dat` key file.
+</Note>
+
+<Steps>
+  <Step title="Open Blocks Directory">
+    Create a reader pointing to your Bitcoin Core blocks directory:
+
+    ```rust
+    use std::path::Path;
+    use sef::chain::blk_file_reader::BlkFileReader;
+
+    let blocks_dir = Path::new("/home/user/.bitcoin/signet/blocks");
+    let reader = BlkFileReader::open(blocks_dir)
+        .expect("Failed to open blocks directory");
+    ```
+
+    The reader will automatically detect and load the XOR key from `xor.dat` if present.
+  </Step>
+
+  <Step title="Stream Blocks">
+    Use the `BlockSource` trait to iterate through blocks:
+
+    ```rust
+    use std::ops::ControlFlow;
+    use sef::chain::stream::{BlockSource, RawBlock};
+
+    let mut block_count = 0;
+    let mut total_bytes = 0;
+
+    reader.for_each_block(&mut |block: RawBlock| {
+        block_count += 1;
+        total_bytes += block.data.len();
+        
+        println!("Block {} at height {}: {} bytes",
+                 block.hash, block.height, block.data.len());
+        
+        // Stop after 100 blocks
+        if block_count >= 100 {
+            return Ok(ControlFlow::Break(()));
+        }
+        
+        Ok(ControlFlow::Continue(()))
+    }).expect("Failed to read blocks");
+
+    println!("Read {} blocks, {} total bytes", block_count, total_bytes);
+    ```
+  </Step>
+
+  <Step title="Get Chain Statistics">
+    Collect aggregate statistics without loading all blocks into memory:
+
+    ```rust
+    let stats = reader.chain_stats()
+        .expect("Failed to collect chain stats");
+
+    println!("Chain statistics:");
+    println!("  Total blocks: {}", stats.block_count);
+    println!("  Total bytes: {}", stats.total_bytes);
+    println!("  Block size range: {} - {} bytes",
+             stats.min_block_size, stats.max_block_size);
+    println!("  Tip: {} at height {}",
+             stats.tip_hash, stats.tip_height);
+    ```
+  </Step>
+</Steps>
+
+## Using KernelBlockReader
+
+<Tip>
+  `KernelBlockReader` is preferred for production use on mainnet as it leverages Bitcoin Core's validated block index.
+</Tip>
+
+<Steps>
+  <Step title="Enable Kernel Feature">
+    Ensure the `kernel` feature is enabled in your `Cargo.toml`:
+
+    ```toml Cargo.toml
+    [dependencies]
+    sef = { version = "0.1", features = ["kernel"] }
+    ```
+
+    The kernel feature is enabled by default.
+  </Step>
+
+  <Step title="Create Reader">
+    Initialize a reader with your Bitcoin Core data directory:
+
+    ```rust
+    use std::path::Path;
+    use bitcoinkernel::ChainType;
+    use sef::chain::KernelBlockReader;
+
+    let data_dir = Path::new("/home/user/.bitcoin/signet");
+    let reader = KernelBlockReader::new(data_dir, ChainType::Signet);
+    ```
+
+    <CodeGroup>
+    ```rust Signet
+    let reader = KernelBlockReader::new(
+        Path::new("/home/user/.bitcoin/signet"),
+        ChainType::Signet
+    );
+    ```
+
+    ```rust Testnet
+    let reader = KernelBlockReader::new(
+        Path::new("/home/user/.bitcoin/testnet3"),
+        ChainType::Testnet
+    );
+    ```
+
+    ```rust Mainnet
+    let reader = KernelBlockReader::new(
+        Path::new("/home/user/.bitcoin"),
+        ChainType::Mainnet
+    );
+    ```
+    </CodeGroup>
+  </Step>
+
+  <Step title="Stream Validated Blocks">
+    Iterate through blocks in height-ordered, validated sequence:
+
+    ```rust
+    use sef::chain::stream::BlockSource;
+    use std::ops::ControlFlow;
+
+    reader.for_each_block(&mut |block| {
+        // Process validated block
+        println!("Height {}: {} ({} bytes)",
+                 block.height, block.hash, block.data.len());
+        
+        Ok(ControlFlow::Continue(()))
+    }).expect("Failed to read blocks");
+    ```
+  </Step>
+</Steps>
+
+## Epoch Grouping
+
+Partition blocks into fixed-size epochs for fountain encoding:
+
+```rust
+use sef::chain::stream::{BlockSource, for_each_epoch};
+use std::ops::ControlFlow;
+
+let k = 100;      // Blocks per epoch
+let buffer = 10;  // Hold back recent blocks (confirmation window)
+
+for_each_epoch(&reader, k, buffer, &mut |batch| {
+    println!("Epoch {}: {} blocks", batch.index, batch.blocks.len());
+    
+    // First and last block in this epoch
+    if let (Some(first), Some(last)) = 
+        (batch.blocks.first(), batch.blocks.last()) {
+        println!("  Height range: {} - {}",
+                 first.height, last.height);
+    }
+    
+    // Now encode this epoch...
+    
+    Ok(ControlFlow::Continue(()))
+}).expect("Failed to process epochs");
+```
+
+<Note>
+  The `buffer` parameter holds back the most recent N blocks to avoid encoding unstable chain tip blocks. Set to 0 to encode all blocks.
+</Note>
+
+## Complete Bitcoin Encode Pipeline
+
+<Steps>
+  <Step title="Set Up Block Reader">
+    ```rust
+    use std::path::Path;
+    use sef::chain::KernelBlockReader;
+    use sef::chain::stream::{BlockSource, for_each_epoch};
+    use bitcoinkernel::ChainType;
+
+    let data_dir = Path::new("/home/user/.bitcoin/signet");
+    let reader = KernelBlockReader::new(data_dir, ChainType::Signet);
+    ```
+  </Step>
+
+  <Step title="Configure Encoding Parameters">
+    ```rust
+    use sef::distribution::RobustSoliton;
+    use sef::droplet::EpochParams;
+
+    let k = 256;          // Blocks per epoch
+    let buffer = 6;       // Confirmation window
+    let c = 0.1;          // RSD tuning constant
+    let delta = 0.05;     // Failure bound
+    let overhead = 1.5;   // Generate 1.5x droplets
+
+    let dist = RobustSoliton::new(k, c, delta);
+    ```
+  </Step>
+
+  <Step title="Process Each Epoch">
+    ```rust
+    use sef::droplet::Encoder;
+    use bitcoin::consensus::deserialize;
+    use bitcoin::Block;
+    use std::ops::ControlFlow;
+
+    for_each_epoch(&reader, k, buffer, &mut |batch| {
+        // Extract block data
+        let block_data: Vec<Vec<u8>> = batch.blocks.iter()
+            .map(|raw| raw.data.clone())
+            .collect();
+
+        // Parse headers for hash verification
+        let block_hashes: Vec<bitcoin::BlockHash> = batch.blocks.iter()
+            .map(|raw| {
+                let block: Block = deserialize(&raw.data).unwrap();
+                block.block_hash()
+            })
+            .collect();
+
+        // Derive deterministic seed from epoch index
+        let epoch_seed = derive_epoch_seed(batch.index);
+        let params = EpochParams::new(
+            batch.index as u64,
+            block_data.len() as u32,
+            epoch_seed
+        );
+
+        // Create encoder
+        let encoder = Encoder::new(&params, &dist, &block_data);
+
+        // Generate droplets
+        let n_droplets = (block_data.len() as f64 * overhead) as u64;
+        let droplets = encoder.generate_n(n_droplets);
+
+        println!("Epoch {}: generated {} droplets for {} blocks",
+                 batch.index, droplets.len(), block_data.len());
+
+        // Save droplets to disk, network, etc.
+        // save_droplets(&droplets)?;
+
+        Ok(ControlFlow::Continue(()))
+    }).expect("Failed to encode epochs");
+
+    fn derive_epoch_seed(epoch_index: usize) -> [u8; 32] {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(b"epoch_seed");
+        hasher.update(&epoch_index.to_le_bytes());
+        hasher.finalize().into()
+    }
+    ```
+  </Step>
+</Steps>
+
+## Decoding Bitcoin Blocks
+
+Use `BitcoinBlockVerifier` to validate recovered blocks during decoding:
+
+```rust
+use sef::decoder::{peeling_decode, BitcoinBlockVerifier};
+use bitcoin::BlockHash;
+
+// Load expected block hashes from header chain (trusted)
+let expected_hashes: Vec<BlockHash> = load_header_chain(epoch_index);
+
+let verifier = BitcoinBlockVerifier {
+    expected_hashes,
+};
+
+// Decode droplets
+let result = peeling_decode(k, droplets, &verifier);
+
+if result.is_success() {
+    println!("Successfully decoded {} blocks", result.decoded_count);
+    
+    // Extract recovered blocks
+    for (i, block_opt) in result.blocks.iter().enumerate() {
+        if let Some(block_data) = block_opt {
+            let block: Block = bitcoin::consensus::deserialize(block_data)
+                .expect("Verified block should deserialize");
+            println!("Block {}: {}", i, block.block_hash());
+        }
+    }
+} else {
+    eprintln!("Decoding failed: {} verify failures",
+              result.verify_failures);
+}
+```
+
+<Tip>
+  The `BitcoinBlockVerifier` uses pre-calculated block hashes from the header chain to validate XOR-peeling results, detecting murky (corrupted) droplets automatically.
+</Tip>
+
+## Memory-Efficient Streaming
+
+Both readers maintain O(epoch_size) memory usage:
+
+<CodeGroup>
+
+```rust BlkFileReader - Two-Pass
+// Pass 1: Scan all blk*.dat files and build hash map
+// Pass 2: Chain blocks by prev_hash in height order
+//
+// Memory: O(chain_size) during scanning
+// For large chains, consider processing in chunks
+```
+
+```rust KernelBlockReader - Streaming
+// Streams directly from validated block index
+// Memory: O(1) per block
+//
+// Ideal for mainnet full nodes
+let reader = KernelBlockReader::new(data_dir, ChainType::Mainnet);
+for_each_epoch(&reader, 1000, 6, &mut |batch| {
+    // Process 1000-block epochs with minimal memory
+    Ok(ControlFlow::Continue(()))
+})?;
+```
+
+</CodeGroup>
+
+## Batch vs Streaming
+
+<Tabs>
+  <Tab title="Streaming (Recommended)">
+    ```rust
+    // O(k) memory - processes one epoch at a time
+    for_each_epoch(&reader, k, buffer, &mut |batch| {
+        let encoder = Encoder::new(&params, &dist, &batch.blocks);
+        let droplets = encoder.generate_n(n);
+        save_droplets(&droplets)?;
+        Ok(ControlFlow::Continue(()))
+    })?;
+    ```
+  </Tab>
+  
+  <Tab title="Batch (Small Chains)">
+    ```rust
+    // O(chain_size) memory - loads all blocks
+    let all_blocks = reader.read_all_blocks()?;
+    let epochs = group_into_epochs(&all_blocks, k, buffer);
+    
+    for epoch_blocks in epochs {
+        // Process each epoch
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Handling XOR Obfuscation
+
+`BlkFileReader` automatically handles Bitcoin Core v28+ XOR obfuscation:
+
+```rust
+let blocks_dir = Path::new("/home/user/.bitcoin/blocks");
+let reader = BlkFileReader::open(blocks_dir)?;
+
+// If xor.dat exists, it's loaded automatically
+// If not present (older Bitcoin Core), no obfuscation is applied
+
+// The reader transparently deobfuscates:
+// - Magic bytes
+// - Block size fields  
+// - Block data
+```
+
+<Note>
+  XOR keys are read from `blocks/xor.dat` and applied with file-offset-dependent key rotation.
+</Note>
+
+## Error Handling
+
+```rust
+use sef::chain::error::ChainError;
+
+match reader.for_each_block(&mut |block| {
+    // Process block
+    Ok(ControlFlow::Continue(()))
+}) {
+    Ok(_) => println!("Successfully processed all blocks"),
+    Err(ChainError::Io(e)) => eprintln!("I/O error: {}", e),
+    Err(ChainError::Parse(e)) => eprintln!("Parse error: {}", e),
+    Err(ChainError::Kernel(e)) => eprintln!("Kernel error: {}", e),
+}
+```
+
+## Next Steps
+
+- Learn about [custom degree distributions](/examples/custom-distribution)
+- Understand [epoch configuration](/api/epoch)
+- Explore [symbol normalization](/api/symbol) for eliminating padding waste

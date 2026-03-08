@@ -1,0 +1,285 @@
+---
+title: "chain"
+description: "Blockchain data ingestion for the fountain encoder"
+---
+
+This module abstracts over different Bitcoin Core data sources via the [`BlockSource`](#blocksource) trait, enabling streaming block access with *O*(*epoch_size*) memory.
+
+Two backends are provided:
+
+- [`BlkFileReader`](#blkfilereader) — parses raw `blk*.dat` files directly, handling XOR obfuscation and chain-ordering internally.
+- [`KernelBlockReader`](#kernelblockreader) *(behind the `kernel` feature flag)* — provides validated, index-ordered block access via the `bitcoinkernel` C library FFI.
+
+## Submodules
+
+- `stream` — core traits ([`BlockSource`](#blocksource)) and epoch grouping ([`for_each_epoch`](../epoch#for_each_epoch)).
+- `blk_file_reader` — raw `blk*.dat` file backend.
+- `kernel_reader` — kernel FFI backend (requires `kernel` feature).
+- `error` — unified `ChainError` type.
+
+---
+
+## BlockSource
+
+```rust
+pub trait BlockSource {
+    fn for_each_block(
+        &self,
+        visitor: &mut dyn FnMut(RawBlock) -> Result<ControlFlow<()>, ChainError>,
+    ) -> Result<(), ChainError>;
+
+    fn read_all_blocks(&self) -> Result<Vec<RawBlock>, ChainError> { /* ... */ }
+    fn chain_stats(&self) -> Result<ChainStats, ChainError> { /* ... */ }
+}
+```
+
+Streaming block access from a Bitcoin data source.
+
+Implementations yield blocks one at a time via a visitor callback, enabling *O*(*epoch_size*) memory usage instead of loading the entire chain. The two provided implementations are [`BlkFileReader`](#blkfilereader) and [`KernelBlockReader`](#kernelblockreader).
+
+### Methods
+
+<ParamField path="for_each_block" type="fn" required>
+  Iterates the active chain in height order, invoking `visitor` once per block.
+
+  The visitor may return `ControlFlow::Break(())` to terminate the scan early.
+
+  **Errors:** Returns `ChainError` if a block cannot be read or deserialized.
+
+  <ParamField path="visitor" type="&mut dyn FnMut(RawBlock) -> Result<ControlFlow<()>, ChainError>" required>
+    Callback invoked for each block in the chain.
+  </ParamField>
+</ParamField>
+
+<ParamField path="read_all_blocks" type="fn">
+  Loads every block on the active chain into memory and returns them.
+
+  This is a convenience wrapper around `for_each_block`. It allocates *O*(*chain_size*) memory and should only be used for testing or small chains.
+
+  **Returns:** `Result<Vec<RawBlock>, ChainError>`
+</ParamField>
+
+<ParamField path="chain_stats" type="fn">
+  Collects `ChainStats` via a single streaming pass, without retaining any block data in memory.
+
+  **Returns:** `Result<ChainStats, ChainError>`
+</ParamField>
+
+### Associated Types
+
+<ResponseField name="RawBlock" type="struct">
+  Minimal representation of a Bitcoin block needed by the fountain encoder.
+
+  <ParamField path="height" type="u32" required>
+    Position in the active chain (genesis = 0).
+  </ParamField>
+
+  <ParamField path="hash" type="String" required>
+    Block hash as a hex-encoded string.
+  </ParamField>
+
+  <ParamField path="data" type="Vec<u8>" required>
+    Full consensus-serialized block bytes.
+  </ParamField>
+</ResponseField>
+
+<ResponseField name="ChainStats" type="struct">
+  Summary statistics collected via a single streaming pass over a `BlockSource`.
+
+  <ParamField path="block_count" type="u32">
+    Total number of blocks processed.
+  </ParamField>
+
+  <ParamField path="total_bytes" type="u64">
+    Sum of all block sizes in bytes.
+  </ParamField>
+
+  <ParamField path="min_block_size" type="usize">
+    Smallest block size encountered.
+  </ParamField>
+
+  <ParamField path="max_block_size" type="usize">
+    Largest block size encountered.
+  </ParamField>
+
+  <ParamField path="tip_height" type="u32">
+    Height of the chain tip.
+  </ParamField>
+
+  <ParamField path="tip_hash" type="String">
+    Hash of the chain tip block.
+  </ParamField>
+</ResponseField>
+
+---
+
+## BlkFileReader
+
+```rust
+pub struct BlkFileReader {
+    blocks_dir: PathBuf,
+    xor_key: Vec<u8>,
+}
+```
+
+Reads blocks from Bitcoin Core's raw `blk*.dat` files.
+
+Handles XOR obfuscation (Bitcoin Core v28+) and chains blocks by `prev_blockhash` to produce canonical height ordering. For mainnet production use, prefer [`KernelBlockReader`](#kernelblockreader) which uses the validated block index.
+
+### Constructor
+
+<ParamField path="open" type="fn" required>
+  ```rust
+  pub fn open(blocks_dir: &Path) -> io::Result<Self>
+  ```
+
+  Opens a blocks directory for reading. Reads the XOR key from `xor.dat` if present.
+
+  <ParamField path="blocks_dir" type="&Path" required>
+    Path to the Bitcoin Core `blocks/` directory.
+  </ParamField>
+
+  **Errors:** Returns `io::Error` if `blocks_dir` cannot be read or `xor.dat` exists but is unreadable.
+</ParamField>
+
+### Implementation Notes
+
+- **Two-pass strategy:** First scans every `blk*.dat` file to collect all blocks into memory, then walks the `prev_blockhash` chain from genesis to produce height-ordered `RawBlock`s.
+- **XOR obfuscation:** Automatically handles Bitcoin Core v28+ obfuscation by reading `xor.dat` key file from the blocks directory.
+- **Magic number detection:** Scans files to identify block boundaries using the network magic bytes.
+
+### Example
+
+```rust
+use std::path::Path;
+use sef::chain::blk_file_reader::BlkFileReader;
+use sef::chain::stream::BlockSource;
+
+let reader = BlkFileReader::open(Path::new("/home/user/.bitcoin/signet/blocks"))?;
+let stats = reader.chain_stats()?;
+println!("Chain tip: {} at height {}", stats.tip_hash, stats.tip_height);
+```
+
+---
+
+## KernelBlockReader
+
+<Note>
+  **Feature flag required:** This type is only available when the `kernel` feature is enabled (enabled by default).
+</Note>
+
+```rust
+pub struct KernelBlockReader {
+    data_dir: String,
+    blocks_dir: String,
+    chain_type: ChainType,
+}
+```
+
+Reads blocks from a Bitcoin Core data directory using the `bitcoinkernel` library, wrapping `ChainstateManager` to stream blocks one at a time with *O*(1) memory per block.
+
+Provides validated, index-ordered block access without manual chain-ordering. Recommended for production use on mainnet.
+
+### Constructor
+
+<ParamField path="new" type="fn" required>
+  ```rust
+  pub fn new(data_dir: &Path, chain_type: ChainType) -> Self
+  ```
+
+  Creates a new reader pointing at the given data directory.
+
+  <ParamField path="data_dir" type="&Path" required>
+    Chain-specific data directory (e.g., `~/.bitcoin/signet`).
+  </ParamField>
+
+  <ParamField path="chain_type" type="ChainType" required>
+    Network type: `ChainType::Mainnet`, `ChainType::Testnet`, `ChainType::Signet`, or `ChainType::Regtest`.
+  </ParamField>
+</ParamField>
+
+### Implementation Notes
+
+- **Validated blocks:** Uses the Bitcoin Core block index for validated, height-ordered access.
+- **FFI-based:** Wraps the `bitcoinkernel` C library via safe Rust bindings.
+- **Initialization:** Automatically imports blocks from disk on first use.
+
+### Example
+
+```rust
+use std::path::Path;
+use bitcoinkernel::ChainType;
+use sef::chain::KernelBlockReader;
+use sef::chain::stream::BlockSource;
+
+let reader = KernelBlockReader::new(
+    Path::new("/home/user/.bitcoin/signet"),
+    ChainType::Signet,
+);
+
+let blocks = reader.read_all_blocks()?;
+println!("Loaded {} blocks", blocks.len());
+```
+
+---
+
+## Related Functions
+
+### for_each_epoch
+
+```rust
+pub fn for_each_epoch<S: BlockSource + ?Sized>(
+    source: &S,
+    k: usize,
+    buffer: usize,
+    visitor: &mut dyn FnMut(EpochBatch) -> Result<ControlFlow<()>, ChainError>,
+) -> Result<(), ChainError>
+```
+
+Streams blocks through an epoch-grouping pipeline.
+
+Invokes `visitor` once per epoch of `k` blocks. The most recent `buffer` blocks are held back and never emitted, simulating a confirmation window that prevents encoding of not-yet-settled chain tip blocks. The last emitted epoch may contain fewer than `k` blocks (a "tail epoch").
+
+Peak memory usage is *O*(*k* + *buffer*).
+
+<ParamField path="source" type="&S" required>
+  Any `BlockSource` implementation to stream blocks from.
+</ParamField>
+
+<ParamField path="k" type="usize" required>
+  Number of blocks per epoch.
+</ParamField>
+
+<ParamField path="buffer" type="usize" required>
+  Number of most-recent blocks to exclude from encoding.
+</ParamField>
+
+<ParamField path="visitor" type="&mut dyn FnMut(EpochBatch) -> Result<ControlFlow<()>, ChainError>" required>
+  Callback invoked for each completed epoch.
+</ParamField>
+
+### group_into_epochs
+
+```rust
+pub fn group_into_epochs(blocks: &[RawBlock], k: usize, buffer: usize) -> Vec<&[RawBlock]>
+```
+
+Groups a pre-loaded slice of blocks into epochs of size `k`.
+
+The last epoch may contain fewer than `k` blocks (a "tail epoch"). The most recent `buffer` blocks are excluded from encoding.
+
+This function requires all blocks in memory. For production use, prefer `for_each_epoch` which streams blocks with *O*(*k* + *buffer*) memory.
+
+<ParamField path="blocks" type="&[RawBlock]" required>
+  Pre-loaded blocks to group.
+</ParamField>
+
+<ParamField path="k" type="usize" required>
+  Number of blocks per epoch.
+</ParamField>
+
+<ParamField path="buffer" type="usize" required>
+  Number of most-recent blocks to exclude from encoding.
+</ParamField>
+
+**Returns:** Vector of slices, each representing one epoch.

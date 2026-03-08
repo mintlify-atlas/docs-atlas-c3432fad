@@ -1,0 +1,284 @@
+---
+title: "Epochs"
+description: "Understanding epoch partitioning, deterministic seed derivation, and auto-scaling heuristics"
+---
+
+An **epoch** is a contiguous group of k blockchain blocks that are fountain-encoded as a single unit. Epochs provide natural parallelization boundaries and enable tunable storage-reduction tradeoffs.
+
+## Why Epochs?
+
+Instead of encoding the entire blockchain as one massive fountain code, SeF partitions it into fixed-size epochs:
+
+<Steps>
+  <Step title="Bounded decode complexity">
+    Decoding cost is O(k²) in the worst case. Smaller epochs (k = 100-1000) keep decode times reasonable.
+  </Step>
+
+  <Step title="Parallelizable encoding">
+    Each epoch can be encoded independently, enabling multi-threaded processing.
+  </Step>
+
+  <Step title="Tunable redundancy">
+    Different epochs can use different (c, δ) parameters based on age or importance.
+  </Step>
+
+  <Step title="Fork-resistant seeds">
+    Epoch seeds are derived from block hashes, binding them to specific chain histories.
+  </Step>
+</Steps>
+
+## Epoch Configuration
+
+The `EpochConfig` struct contains all user-facing parameters:
+
+```rust
+pub struct EpochConfig {
+    /// Number of source blocks per epoch (K)
+    pub k: usize,
+
+    /// Number of droplets to generate (0 = auto-scale)
+    pub n: u64,
+
+    /// Number of recent blocks to exclude from encoding
+    pub buffer: usize,
+
+    /// Robust Soliton parameter c
+    pub c: f64,
+
+    /// Robust Soliton parameter δ
+    pub delta: f64,
+
+    /// Fixed symbol size in bytes (0 = disabled)
+    pub symbol_size: usize,
+}
+```
+Source: `src/epoch.rs:25`
+
+### Key Parameters
+
+| Parameter | Typical Value | Purpose |
+|-----------|---------------|----------|
+| `k` | 100-10000 | Epoch size — number of source blocks |
+| `n` | 0 (auto) | Droplet count (0 triggers auto-scaling) |
+| `buffer` | 10 | Recent blocks kept in raw form |
+| `c` | 0.1 | RSD tuning constant |
+| `delta` | 0.05 | Failure probability bound |
+| `symbol_size` | 4096 | Fixed symbol size (0 = variable blocks) |
+
+<Note>
+The buffer parameter creates a confirmation window: the most recent blocks remain immediately accessible without decoding. This is critical for querying recent transactions.
+</Note>
+
+## Deterministic Seed Derivation
+
+Each epoch has a unique 256-bit seed derived via SHA-256 domain separation:
+
+```rust
+pub fn compute_epoch_seed(epoch_idx: usize, first_block_hash: &str) -> [u8; 32] {
+    Sha256::new()
+        .chain_update(b"epoch_seed")
+        .chain_update((epoch_idx as u64).to_le_bytes())
+        .chain_update(first_block_hash.as_bytes())
+        .finalize()
+        .into()
+}
+```
+Source: `src/epoch.rs:62`
+
+### Why Include the Block Hash?
+
+Binding the seed to the first block's hash prevents **seed replay attacks** across forks:
+
+- Two epochs with the same index on different forks produce **different seeds**
+- This ensures droplets from one fork cannot be used to reconstruct blocks on another fork
+- It provides cryptographic fork-resistance without additional overhead
+
+<Info>
+The domain separator `b"epoch_seed"` prevents collisions with other SHA-256 uses in the codebase (e.g., droplet seed derivation uses `b"droplet"`).
+</Info>
+
+## EpochParams: Encoding Context
+
+The `EpochParams` struct is passed to the encoder and contains the runtime parameters for a specific epoch:
+
+```rust
+pub struct EpochParams {
+    /// Unique identifier for the epoch
+    pub epoch_id: u64,
+
+    /// Number of source blocks in the epoch (K)
+    pub k: u32,
+
+    /// Root seed for deterministic droplet generation
+    pub epoch_seed: [u8; 32],
+}
+```
+Source: `src/droplet.rs:71`
+
+### Per-Droplet Seed Derivation
+
+Each droplet within an epoch gets its own deterministic PRNG seed:
+
+```rust
+fn droplet_rng(&self, droplet_id: u64) -> ChaCha8Rng {
+    let hash = Sha256::new()
+        .chain_update(self.epoch_seed)
+        .chain_update(b"droplet")
+        .chain_update(self.epoch_id.to_le_bytes())
+        .chain_update(droplet_id.to_le_bytes())
+        .finalize();
+
+    ChaCha8Rng::from_seed(hash.into())
+}
+```
+Source: `src/droplet.rs:114`
+
+<Accordion title="Why ChaCha8Rng?">
+ChaCha8 is a cryptographically secure PRNG that:
+
+1. Has excellent statistical properties (passes BigCrush)
+2. Is faster than ChaCha20 while still secure for non-adversarial use
+3. Is seeded with 256 bits from SHA-256, providing full entropy
+
+This determinism allows any peer to regenerate droplet i by knowing only the epoch parameters and i.
+</Accordion>
+
+## Auto-Scaling Droplets
+
+When `n = 0`, the library automatically selects the droplet count based on epoch size:
+
+```rust
+pub fn auto_scale_droplets(unit_k: usize, n: u64) -> u64 {
+    if n == 0 {
+        let multiplier = if unit_k < 50 {
+            5
+        } else if unit_k < 200 {
+            3
+        } else {
+            2
+        };
+        (unit_k as u64) * multiplier
+    } else {
+        n
+    }
+}
+```
+Source: `src/epoch.rs:82`
+
+### Scaling Rationale
+
+| k Range | Multiplier | Overhead | Why? |
+|---------|------------|----------|------|
+| < 50 | 5× | 400% | Small epochs suffer higher RSD overhead; extra droplets prevent stalls |
+| 50-199 | 3× | 200% | Standard safety margin for moderate epochs |
+| ≥ 200 | 2× | 100% | Large k concentrates the RSD well; minimal surplus needed |
+
+<Warning>
+These multipliers are heuristics. For mission-critical deployments, run simulations with your specific (k, c, δ) parameters to determine the optimal overhead.
+</Warning>
+
+## Example: Encoding Multiple Epochs
+
+```rust
+use sef::epoch::{compute_epoch_seed, auto_scale_droplets};
+use sef::distribution::RobustSoliton;
+use sef::droplet::{Encoder, EpochParams};
+
+let k = 100;
+let c = 0.1;
+let delta = 0.05;
+
+// Process 10 epochs
+for epoch_idx in 0..10 {
+    // Mock: in practice, extract from blockchain
+    let first_block_hash = format!("block_{}", epoch_idx * k);
+    let blocks: Vec<Vec<u8>> = (0..k)
+        .map(|i| vec![(i & 0xFF) as u8; 256])
+        .collect();
+
+    // Derive unique epoch seed
+    let seed = compute_epoch_seed(epoch_idx, &first_block_hash);
+    let params = EpochParams::new(epoch_idx as u64, k as u32, seed);
+
+    // Auto-scale droplet count
+    let n = auto_scale_droplets(k, 0);
+    println!("Epoch {}: generating {} droplets", epoch_idx, n);
+
+    // Encode
+    let dist = RobustSoliton::new(k, c, delta);
+    let encoder = Encoder::new(&params, &dist, &blocks);
+    let droplets = encoder.generate_n(n);
+
+    // Serialize droplets to disk...
+}
+```
+
+## Buffer Window
+
+The buffer parameter excludes the most recent blocks from encoding:
+
+```
+Block timeline:
+┌─────────────────────────────────────────┬──────────────┐
+│   Encoded epochs (fountain-coded)       │    Buffer    │
+│   (requires decode to access)           │ (raw blocks) │
+└─────────────────────────────────────────┴──────────────┘
+                                          ↑
+                                     Height - buffer
+```
+
+<Info>
+Typical buffer sizes:
+
+- Bitcoin: 6-10 blocks (~1-2 hours)
+- High-throughput chains: 100-1000 blocks
+
+Choose based on how far back "recent" queries typically go.
+</Info>
+
+## CLI Example
+
+```bash
+# Generate droplets for epochs of 100 blocks each
+sef generate \
+  --blocks-dir ~/.bitcoin/signet/blocks \
+  --output droplets/ \
+  --k 100 \
+  --buffer 10 \
+  --symbol-size 4096
+
+# Decode a specific epoch
+sef decode \
+  --input droplets/ \
+  --output decoded/ \
+  --epoch 42
+```
+
+## Symbol Normalization (Optional)
+
+When `symbol_size > 0`, variable-length blocks are concatenated and sliced into uniform symbols:
+
+```rust
+use sef::symbol::blocks_to_symbols;
+
+let blocks: Vec<Vec<u8>> = vec![
+    vec![0xAA; 100],
+    vec![0xBB; 200],
+    vec![0xCC; 150],
+];
+
+let (symbols, manifest) = blocks_to_symbols(&blocks, 128);
+// symbols is Vec<Vec<u8>>, each exactly 128 bytes
+// manifest records original block boundaries
+```
+
+This eliminates padding waste when blocks vary widely in size.
+
+<Note>
+Symbol mode changes the verification strategy: use `SymbolVerifier` instead of `BitcoinBlockVerifier` when decoding.
+</Note>
+
+## References
+
+- Section IV.A of the [SeF paper](https://arxiv.org/abs/1906.12140) discusses epoch sizing tradeoffs
+- [Bitcoin block structure](https://developer.bitcoin.org/reference/block_chain.html) for understanding block boundaries

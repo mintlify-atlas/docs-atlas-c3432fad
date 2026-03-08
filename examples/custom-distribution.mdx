@@ -1,0 +1,468 @@
+---
+title: "Custom Degree Distributions"
+description: "Implement custom degree distributions by implementing the DegreeDistribution trait"
+---
+
+## Overview
+
+SeF's encoder is parameterized over any type implementing the `DegreeDistribution` trait, allowing you to experiment with custom distributions beyond the standard Robust Soliton Distribution (RSD).
+
+## The DegreeDistribution Trait
+
+The trait defines how many source blocks are combined into each encoded droplet:
+
+```rust
+pub trait DegreeDistribution {
+    /// Samples a degree d satisfying 1 ≤ d ≤ K
+    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize;
+
+    /// Computes the expected value E[D] of the distribution
+    fn expected_degree(&self) -> f64;
+}
+```
+
+<Note>
+  Implementations **must** guarantee that `sample_degree` returns a value in `[1, K]` where K is the number of source blocks.
+</Note>
+
+## Simple Custom Distributions
+
+<Steps>
+  <Step title="Always Degree 1 (Singletons Only)">
+    A trivial distribution that always returns degree 1:
+
+    ```rust
+    use sef::distribution::DegreeDistribution;
+    use rand::Rng;
+
+    struct AlwaysOne;
+
+    impl DegreeDistribution for AlwaysOne {
+        fn sample_degree<R: Rng + ?Sized>(&self, _rng: &mut R) -> usize {
+            1
+        }
+
+        fn expected_degree(&self) -> f64 {
+            1.0
+        }
+    }
+    ```
+
+    **Use case**: Testing singleton-only decoding, or when transmitting raw blocks with fountain-code labeling.
+
+    ```rust
+    use sef::droplet::{Encoder, EpochParams};
+
+    let k = 50;
+    let blocks: Vec<Vec<u8>> = (0..k).map(|i| vec![i as u8; 64]).collect();
+    let params = EpochParams::new(0, k as u32, [0u8; 32]);
+    
+    let dist = AlwaysOne;
+    let encoder = Encoder::new(&params, &dist, &blocks);
+    let droplets = encoder.generate_n(k as u64);
+
+    // All droplets are singletons
+    for droplet in &droplets {
+        assert!(droplet.is_singleton());
+    }
+    ```
+  </Step>
+
+  <Step title="Fixed Degree">
+    A distribution that always returns a constant degree:
+
+    ```rust
+    struct FixedDegree {
+        degree: usize,
+    }
+
+    impl DegreeDistribution for FixedDegree {
+        fn sample_degree<R: Rng + ?Sized>(&self, _rng: &mut R) -> usize {
+            self.degree
+        }
+
+        fn expected_degree(&self) -> f64 {
+            self.degree as f64
+        }
+    }
+
+    // Create a degree-3 distribution
+    let dist = FixedDegree { degree: 3 };
+    let encoder = Encoder::new(&params, &dist, &blocks);
+    let droplets = encoder.generate_n(100);
+
+    // All droplets have degree 3
+    for droplet in &droplets {
+        assert_eq!(droplet.degree(), 3);
+    }
+    ```
+
+    **Use case**: Analyzing XOR performance, testing specific graph structures.
+  </Step>
+
+  <Step title="Uniform Random Degree">
+    Sample uniformly from `[min_degree, max_degree]`:
+
+    ```rust
+    use rand::Rng;
+
+    struct UniformDegree {
+        min: usize,
+        max: usize,
+    }
+
+    impl DegreeDistribution for UniformDegree {
+        fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
+            rng.gen_range(self.min..=self.max)
+        }
+
+        fn expected_degree(&self) -> f64 {
+            (self.min + self.max) as f64 / 2.0
+        }
+    }
+
+    let dist = UniformDegree { min: 2, max: 10 };
+    let encoder = Encoder::new(&params, &dist, &blocks);
+    let droplets = encoder.generate_n(200);
+
+    // Check degree range
+    for droplet in &droplets {
+        let d = droplet.degree();
+        assert!(d >= 2 && d <= 10);
+    }
+
+    println!("Expected degree: {}", dist.expected_degree()); // 6.0
+    ```
+  </Step>
+</Steps>
+
+## Advanced: Weighted Sampling
+
+Implement a custom PMF with weighted degree sampling:
+
+```rust
+use rand::Rng;
+
+struct WeightedDegree {
+    /// CDF over degrees [1, K]
+    cdf: Vec<f64>,
+}
+
+impl WeightedDegree {
+    /// Creates a weighted distribution from probability mass function
+    /// pmf[i] = probability of degree (i+1)
+    fn new(pmf: Vec<f64>) -> Self {
+        assert!(!pmf.is_empty(), "PMF cannot be empty");
+        
+        // Normalize PMF
+        let total: f64 = pmf.iter().sum();
+        let normalized: Vec<f64> = pmf.iter().map(|p| p / total).collect();
+        
+        // Build CDF
+        let mut cdf = Vec::with_capacity(pmf.len());
+        let mut cumsum = 0.0;
+        for &p in &normalized {
+            cumsum += p;
+            cdf.push(cumsum);
+        }
+        cdf.last_mut().map(|last| *last = 1.0); // Ensure closure
+        
+        Self { cdf }
+    }
+}
+
+impl DegreeDistribution for WeightedDegree {
+    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
+        let u: f64 = rng.gen();
+        
+        // Binary search over CDF
+        let idx = self.cdf
+            .binary_search_by(|v| {
+                v.partial_cmp(&u).expect("NaN in CDF")
+            })
+            .unwrap_or_else(|e| e);
+        
+        // Return degree (1-indexed)
+        (idx + 1).min(self.cdf.len())
+    }
+
+    fn expected_degree(&self) -> f64 {
+        self.cdf
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| {
+                let degree = (i + 1) as f64;
+                let prob = w[1] - w[0];
+                degree * prob
+            })
+            .sum::<f64>()
+            + if self.cdf.len() == 1 {
+                self.cdf[0] // Single degree case
+            } else {
+                0.0
+            }
+    }
+}
+```
+
+### Example: Bimodal Distribution
+
+Create a distribution that favors degrees 1 and 10:
+
+```rust
+// PMF: 60% degree 1, 10% degree 2-9, 30% degree 10
+let mut pmf = vec![0.6]; // degree 1
+pmf.extend(vec![0.01; 8]); // degrees 2-9 (0.08 total)
+pmf.push(0.32); // degree 10 (adjusted to sum to 1.0)
+
+let dist = WeightedDegree::new(pmf);
+let encoder = Encoder::new(&params, &dist, &blocks);
+let droplets = encoder.generate_n(1000);
+
+// Analyze degree distribution
+let mut degree_counts = vec![0; 11];
+for droplet in &droplets {
+    degree_counts[droplet.degree()] += 1;
+}
+
+println!("Degree distribution:");
+for (d, count) in degree_counts.iter().enumerate().skip(1) {
+    println!("  d={}: {} ({:.1}%)", d, count, 
+             100.0 * *count as f64 / droplets.len() as f64);
+}
+```
+
+## Comparing Distributions
+
+Benchmark different distributions for decoding performance:
+
+```rust
+use sef::decoder::peeling_check;
+
+fn test_distribution<D: DegreeDistribution>(
+    dist: &D,
+    k: usize,
+    n_droplets: u64,
+    trials: usize,
+) -> f64 {
+    let mut success_count = 0;
+    
+    for trial in 0..trials {
+        let blocks: Vec<Vec<u8>> = (0..k)
+            .map(|i| vec![i as u8; 64])
+            .collect();
+        
+        let seed = [trial as u8; 32];
+        let params = EpochParams::new(trial as u64, k as u32, seed);
+        let encoder = Encoder::new(&params, dist, &blocks);
+        let droplets = encoder.generate_n(n_droplets);
+        
+        // Graph-only peeling check
+        let indices: Vec<Vec<u32>> = droplets.iter()
+            .map(|d| d.indices.clone())
+            .collect();
+        let result = peeling_check(k, &indices);
+        
+        if result.success {
+            success_count += 1;
+        }
+    }
+    
+    success_count as f64 / trials as f64
+}
+
+// Compare RSD vs uniform
+let k = 100;
+let n = 150; // 1.5x overhead
+
+let rsd = RobustSoliton::new(k, 0.1, 0.05);
+let uniform = UniformDegree { min: 1, max: 20 };
+
+println!("Success rates (k={}, n={}, 100 trials):", k, n);
+println!("  RSD:     {:.1}%", 100.0 * test_distribution(&rsd, k, n, 100));
+println!("  Uniform: {:.1}%", 100.0 * test_distribution(&uniform, k, n, 100));
+```
+
+## Ideal Soliton Distribution
+
+The theoretical (non-robust) Ideal Soliton Distribution:
+
+```rust
+struct IdealSoliton {
+    k: usize,
+    cdf: Vec<f64>,
+}
+
+impl IdealSoliton {
+    fn new(k: usize) -> Self {
+        let mut cdf = vec![0.0; k + 1];
+        let mut cumsum = 0.0;
+        
+        for d in 1..=k {
+            let rho = if d == 1 {
+                1.0 / k as f64
+            } else {
+                1.0 / (d as f64 * (d as f64 - 1.0))
+            };
+            cumsum += rho;
+            cdf[d] = cumsum;
+        }
+        
+        // Normalize
+        let total = cdf[k];
+        for c in cdf.iter_mut() {
+            *c /= total;
+        }
+        cdf[k] = 1.0;
+        
+        Self { k, cdf }
+    }
+}
+
+impl DegreeDistribution for IdealSoliton {
+    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
+        let u: f64 = rng.gen();
+        let idx = self.cdf[1..]
+            .binary_search_by(|v| v.partial_cmp(&u).unwrap())
+            .unwrap_or_else(|e| e);
+        (idx + 1).clamp(1, self.k)
+    }
+
+    fn expected_degree(&self) -> f64 {
+        self.cdf[..=self.k]
+            .windows(2)
+            .enumerate()
+            .map(|(i, w)| {
+                let d = (i + 1) as f64;
+                let p = w[1] - w[0];
+                d * p
+            })
+            .sum()
+    }
+}
+```
+
+<Note>
+  The Ideal Soliton has optimal expected degree but suffers from ripple collapse during decoding. Always use RobustSoliton for production.
+</Note>
+
+## Parameterizing the Robust Soliton
+
+Tune RSD parameters for different use cases:
+
+<Tabs>
+  <Tab title="Low Overhead">
+    ```rust
+    // Minimize redundancy, accept higher failure risk
+    let dist = RobustSoliton::new(
+        k,
+        0.03,  // Small c = thinner spike
+        0.1    // Relaxed delta
+    );
+    
+    println!("Expected degree: {:.2}", dist.expected_degree());
+    // Typical result: 4-6 for k=100
+    ```
+  </Tab>
+  
+  <Tab title="High Reliability">
+    ```rust
+    // Maximize decode probability, accept more overhead
+    let dist = RobustSoliton::new(
+        k,
+        0.2,    // Large c = wider spike
+        0.001   // Tight delta
+    );
+    
+    println!("Expected degree: {:.2}", dist.expected_degree());
+    // Typical result: 12-18 for k=100
+    ```
+  </Tab>
+  
+  <Tab title="Balanced (Recommended)">
+    ```rust
+    // Good trade-off for most applications
+    let dist = RobustSoliton::new(
+        k,
+        0.1,   // Moderate c
+        0.05   // Moderate delta
+    );
+    
+    println!("Expected degree: {:.2}", dist.expected_degree());
+    // Typical result: 8-10 for k=100
+    ```
+  </Tab>
+</Tabs>
+
+## Reusing Distributions
+
+RSD precomputes a CDF for a specific K. Use `rebuild` when K changes:
+
+```rust
+let mut dist = RobustSoliton::new(100, 0.1, 0.05);
+println!("Built for k={}", dist.k());
+
+// Process epoch with k=100
+let encoder1 = Encoder::new(&params1, &dist, &blocks1);
+let droplets1 = encoder1.generate_n(150);
+
+// Rebuild for different epoch size
+dist.rebuild(256);
+println!("Rebuilt for k={}", dist.k());
+
+let encoder2 = Encoder::new(&params2, &dist, &blocks2);
+let droplets2 = encoder2.generate_n(400);
+```
+
+<Tip>
+  Rebuilding is O(k) but avoids reallocation. For varying epoch sizes, consider a cache of distributions.
+</Tip>
+
+## Testing Custom Distributions
+
+Validate your distribution with statistical tests:
+
+```rust
+use rand::SeedableRng;
+use rand_chacha::ChaCha8Rng;
+
+fn validate_distribution<D: DegreeDistribution>(
+    dist: &D,
+    k: usize,
+    samples: usize,
+) {
+    let mut rng = ChaCha8Rng::seed_from_u64(42);
+    let mut histogram = vec![0usize; k + 1];
+    
+    // Sample many degrees
+    for _ in 0..samples {
+        let d = dist.sample_degree(&mut rng);
+        assert!(d >= 1 && d <= k, "Degree {} out of range [1, {}]", d, k);
+        histogram[d] += 1;
+    }
+    
+    // Compute empirical mean
+    let empirical_mean: f64 = (1..=k)
+        .map(|d| d as f64 * histogram[d] as f64)
+        .sum::<f64>() / samples as f64;
+    
+    let expected = dist.expected_degree();
+    let error = (empirical_mean - expected).abs();
+    
+    println!("Empirical mean: {:.3}", empirical_mean);
+    println!("Expected mean:  {:.3}", expected);
+    println!("Error:          {:.3}", error);
+    
+    assert!(error < 0.1, "Mean deviated too far from expected");
+}
+
+// Test your custom distribution
+let dist = WeightedDegree::new(vec![0.5, 0.3, 0.2]);
+validate_distribution(&dist, 3, 100_000);
+```
+
+## Next Steps
+
+- Return to [encode-decode examples](/examples/encode-decode)
+- Learn about [Bitcoin integration](/examples/bitcoin-integration)
+- Explore the [experiment module](/api/experiment) for graph simulations

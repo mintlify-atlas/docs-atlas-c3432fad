@@ -1,0 +1,286 @@
+---
+title: sef reconstruct
+description: End-to-end encode → decode → verify round-trip test
+---
+
+## Synopsis
+
+```bash
+sef reconstruct --blocks-dir <PATH> [OPTIONS]
+```
+
+## Description
+
+Performs an end-to-end fountain encoding and decoding test without writing droplets to disk. This command is useful for:
+- Testing encoding/decoding parameters
+- Measuring throughput and success rates
+- Verifying byte-for-byte reconstruction
+- Benchmarking different configurations
+
+The command:
+1. Reads blocks from the specified directory
+2. Encodes them into droplets in memory
+3. Immediately decodes the droplets
+4. Verifies recovered blocks match the originals byte-for-byte
+5. Reports statistics for each epoch
+
+<Note>
+  This command does **not** write droplets to disk. Use [`generate`](/cli/generate) and [`decode`](/cli/decode) for persistent storage.
+</Note>
+
+## Required Arguments
+
+<ParamField path="blocks-dir" type="path" required>
+  Path to Bitcoin blocks directory.
+  
+  - With `kernel` feature: Path to datadir parent (e.g., `~/.bitcoin/signet`)
+  - Without `kernel` feature: Path to blocks directory containing `blk*.dat` files
+  
+  **Short flag:** `-b`
+  
+  **Example:** `~/.bitcoin/signet/blocks`
+</ParamField>
+
+## Options
+
+<ParamField path="k" type="integer" default="100">
+  Epoch size — number of blocks per epoch.
+  
+  **Short flag:** `-k`
+</ParamField>
+
+<ParamField path="n" type="integer" default="0">
+  Number of droplets per epoch.
+  
+  - `0` (default): Auto-scale to 2× the symbol count
+  - Explicit value: Generate exactly `n` droplets
+  
+  **Short flag:** `-n`
+</ParamField>
+
+<ParamField path="buffer" type="integer" default="10">
+  Number of recent blocks to exclude from encoding.
+  
+  Recent blocks are skipped to maintain a confirmation window.
+</ParamField>
+
+<ParamField path="c" type="float" default="0.1">
+  Robust Soliton parameter c — tuning constant.
+  
+  **Short flag:** `-c`
+</ParamField>
+
+<ParamField path="delta" type="float" default="0.05">
+  Robust Soliton parameter delta — failure probability.
+</ParamField>
+
+<ParamField path="epoch" type="integer">
+  Only reconstruct this specific epoch index (optional).
+  
+  If not specified, all epochs are processed.
+  
+  **Example:** `--epoch 5`
+</ParamField>
+
+<ParamField path="symbol-size" type="integer" default="4096">
+  Symbol size in bytes for block concatenation.
+  
+  - `0`: Encode blocks directly
+  - `> 0`: Use fixed-size symbol normalization
+</ParamField>
+
+## Examples
+
+### Basic Usage
+
+<CodeGroup>
+
+```bash Default parameters
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --k 100
+```
+
+```bash Test specific epoch
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --k 100 --epoch 5
+```
+
+```bash High reliability test
+sef reconstruct \
+  --blocks-dir ~/.bitcoin/signet/blocks \
+  --k 50 \
+  --c 0.05 \
+  --delta 0.01 \
+  --n 150
+```
+
+```bash Without symbol normalization
+sef reconstruct \
+  --blocks-dir ~/.bitcoin/signet/blocks \
+  --k 100 \
+  --symbol-size 0
+```
+
+</CodeGroup>
+
+### Example Output
+
+```
+=== Fountain Code Reconstruction ===
+
+Streaming blocks from: /home/user/.bitcoin/signet/blocks
+Symbol normalization: symbol_size=4096 bytes
+  Epoch   0: ✓ OK | 100/100 blocks | enc 45.2ms | dec 12.3ms | 200 droplets (k_sym=100) | 0 verify_fail
+  Epoch   1: ✓ OK | 100/100 blocks | enc 44.8ms | dec 11.9ms | 200 droplets (k_sym=100) | 0 verify_fail
+  Epoch   2: ✓ OK | 100/100 blocks | enc 46.1ms | dec 12.1ms | 200 droplets (k_sym=100) | 0 verify_fail
+
+=== Reconstruction Summary ===
+  Blocks recovered:   300/300
+  Recovery rate:      100.0%
+  Source data:         0.14 MB
+  Recovered data:     0.14 MB
+  Encode throughput:  1051.2 MB/s
+  Decode throughput:  3847.5 MB/s
+  Verify failures:    0
+  Total time:         0.42s
+```
+
+### Example: Failed Reconstruction
+
+When decoding fails (insufficient droplets or corrupted data):
+
+```
+  Epoch   3: ✗ FAIL | 85/100 blocks | enc 47.3ms | dec 19.8ms | 180 droplets (k_sym=100) | 2 verify_fail
+         Stall: 15 undecoded symbols
+           symbol  42: referenced by 8 remaining droplets
+           symbol  67: referenced by 5 remaining droplets
+           symbol  91: referenced by 3 remaining droplets
+           ...
+```
+
+## Output Statuses
+
+| Status | Meaning |
+|--------|----------|
+| `✓ OK` | All blocks recovered and verified byte-for-byte |
+| `⚠ HASH OK, BYTES DIFFER` | Block hashes match but byte content differs (should never happen) |
+| `✗ FAIL` | Decoding stalled before recovering all symbols |
+
+## Verification Modes
+
+### With Symbol Normalization (`--symbol-size > 0`)
+
+1. Symbols are verified using SHA-256 hashes during decoding
+2. Recovered symbols are reassembled into blocks
+3. Blocks are compared byte-for-byte with originals
+
+### Without Symbol Normalization (`--symbol-size 0`)
+
+1. Blocks are verified using Bitcoin block hashes during decoding
+2. Recovered blocks are compared byte-for-byte with originals
+
+<Tip>
+  Symbol normalization is recommended for production use as it provides better XOR uniformity and per-symbol verification.
+</Tip>
+
+## Performance Metrics
+
+### Encode Throughput
+
+Measures data processed per second during encoding:
+
+```
+Encode throughput = Total source bytes / Total encode time
+```
+
+Typical values: 100–1000 MB/s depending on symbol size and degree distribution.
+
+### Decode Throughput
+
+Measures data recovered per second during decoding:
+
+```
+Decode throughput = Total recovered bytes / Total decode time
+```
+
+Decoding is typically 3–10× faster than encoding due to the incremental peeling process.
+
+### Verify Failures
+
+Counts the number of symbols that failed hash verification during decoding. Should be 0 for honest droplets.
+
+## Use Cases
+
+### Parameter Tuning
+
+Test different values of `k`, `c`, and `delta` to find optimal configurations:
+
+```bash
+# Test small epochs
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --k 50
+
+# Test large epochs
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --k 500
+
+# Test low overhead
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --k 100 --n 120
+```
+
+### Benchmarking
+
+Measure encoding/decoding performance on your hardware:
+
+```bash
+# Benchmark without symbol normalization
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --k 100 --symbol-size 0
+
+# Benchmark with different symbol sizes
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --k 100 --symbol-size 2048
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --k 100 --symbol-size 8192
+```
+
+### Verification Testing
+
+Validate that reconstruction is byte-perfect:
+
+```bash
+# Test specific epoch that had issues
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --epoch 42
+```
+
+## Troubleshooting
+
+### Low Success Rate
+
+**Cause:** Insufficient droplets for the given parameters.
+
+**Solution:** Increase `--n` or decrease `k`.
+
+### "BYTES DIFFER" Warning
+
+**Cause:** Block hash matches but byte content differs (indicates a bug).
+
+**Solution:** Report this as a bug with the epoch index and parameters used.
+
+### High Verify Failures
+
+**Cause:** Should not occur in `reconstruct` (droplets are generated and decoded in-process).
+
+**Solution:** Report as a bug.
+
+## Comparison with Other Commands
+
+| Feature | `reconstruct` | `generate` + `decode` |
+|---------|---------------|------------------------|
+| Writes droplets to disk | ❌ No | ✅ Yes |
+| Byte-for-byte verification | ✅ Yes | ⚠️ Hash-only |
+| Speed | ⚡ Faster (in-memory) | 🐢 Slower (disk I/O) |
+| Use case | Testing, benchmarking | Production encoding/decoding |
+
+<Note>
+  Use `reconstruct` for testing and validation. Use `generate` + `decode` for actual blockchain pruning.
+</Note>
+
+## See Also
+
+- [`sef generate`](/cli/generate) — Generate persistent droplets
+- [`sef decode`](/cli/decode) — Decode droplets from disk
+- [`sef experiment`](/cli/experiment) — Run systematic parameter sweeps

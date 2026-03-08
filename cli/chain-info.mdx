@@ -1,0 +1,249 @@
+---
+title: sef chain-info
+description: Display blockchain statistics and metadata
+---
+
+## Synopsis
+
+```bash
+sef chain-info --blocks-dir <PATH>
+```
+
+## Description
+
+Reads blocks from a Bitcoin data directory and displays summary statistics including:
+- Total number of blocks
+- Total data size
+- Block size distribution (min, max, average)
+- Chain tip (height and hash)
+
+This command is useful for:
+- Verifying blockchain data is accessible
+- Understanding block size distribution for parameter tuning
+- Checking chain tip before encoding
+
+<Note>
+  This command only reads block metadata and does not perform encoding or decoding. It's a fast way to inspect your blockchain data directory.
+</Note>
+
+## Required Arguments
+
+<ParamField path="blocks-dir" type="path" required>
+  Path to Bitcoin blocks directory.
+  
+  - With `kernel` feature: Path to datadir parent (e.g., `~/.bitcoin/signet`)
+  - Without `kernel` feature: Path to blocks directory containing `blk*.dat` files
+  
+  **Short flag:** `-b`
+  
+  **Example:** `~/.bitcoin/signet/blocks`
+</ParamField>
+
+## Examples
+
+### Basic Usage
+
+<CodeGroup>
+
+```bash Show signet chain info
+sef chain-info --blocks-dir ~/.bitcoin/signet/blocks
+```
+
+```bash Show mainnet chain info
+sef chain-info --blocks-dir ~/.bitcoin/blocks
+```
+
+```bash Show testnet chain info
+sef chain-info --blocks-dir ~/.bitcoin/testnet3/blocks
+```
+
+</CodeGroup>
+
+### Example Output
+
+```
+Reading blocks from: /home/user/.bitcoin/signet/blocks
+Chain loaded in 0.34s
+  Total blocks:    25847
+  Total data:      45.23 MB
+  Block sizes:
+    min: 285 bytes
+    max: 1048576 bytes
+    avg: 1751 bytes
+  Tip: height=25846, hash=000000a4f2c8e8e5e2c6d5a2b8e7f9d4c3b2a1f0e9d8c7b6a5948372615049
+```
+
+## Output Fields
+
+### Total Blocks
+
+The total number of blocks found in the data directory, including:
+- Genesis block
+- All blocks up to the chain tip
+
+For signet, this is typically 25,000–50,000 blocks. For mainnet, this is 800,000+ blocks.
+
+### Total Data
+
+The sum of all block sizes in megabytes (MB).
+
+```
+Total data = Σ(block sizes) / 1,000,000
+```
+
+This represents the raw blockchain data size before any compression or pruning.
+
+### Block Sizes
+
+| Statistic | Description |
+|-----------|-------------|
+| `min` | Smallest block size in bytes (typically 285 bytes for empty blocks) |
+| `max` | Largest block size in bytes (capped at 1 MB for pre-segwit, 4 MB weight for post-segwit) |
+| `avg` | Average block size across all blocks |
+
+<Tip>
+  Use the average block size to estimate optimal `--symbol-size` for the [`generate`](/cli/generate) command. A good rule of thumb is `symbol_size ≈ 2–4× avg_block_size`.
+</Tip>
+
+### Chain Tip
+
+The highest block in the chain:
+- **height:** Block number (0-indexed from genesis)
+- **hash:** Block hash in hex format
+
+This is useful for verifying you're working with the expected chain tip before encoding.
+
+## Use Cases
+
+### Pre-Encoding Checks
+
+Before running [`generate`](/cli/generate), use `chain-info` to verify:
+
+```bash
+# Check data is accessible
+sef chain-info --blocks-dir ~/.bitcoin/signet/blocks
+
+# If OK, proceed with encoding
+sef generate --blocks-dir ~/.bitcoin/signet/blocks --k 100
+```
+
+### Parameter Tuning
+
+Use block size statistics to choose optimal parameters:
+
+```bash
+# Check average block size
+sef chain-info --blocks-dir ~/.bitcoin/signet/blocks
+# Output: avg: 1751 bytes
+
+# Set symbol_size to 2-4x average
+sef generate --blocks-dir ~/.bitcoin/signet/blocks --symbol-size 4096
+```
+
+### Capacity Planning
+
+Estimate storage requirements before encoding:
+
+```python
+# Given chain-info output:
+total_data_mb = 45.23
+k = 100
+n_droplets = 200  # 2x overhead
+
+# Expected droplet storage:
+droplet_data_mb = total_data_mb * (n_droplets / k)
+print(f"Expected droplet storage: {droplet_data_mb:.2f} MB")
+# Output: Expected droplet storage: 90.46 MB
+```
+
+## Feature Differences
+
+### With `kernel` Feature (Default)
+
+Uses `bitcoinkernel` to read validated blocks:
+
+```bash
+# Pass parent directory of blocks/
+sef chain-info --blocks-dir ~/.bitcoin/signet
+```
+
+**Advantages:**
+- Validated blocks only (skips invalid/orphan blocks)
+- Correct chain tip (follows best chain)
+- Full metadata available
+
+### Without `kernel` Feature
+
+Uses raw `blk*.dat` file parsing:
+
+```bash
+# Pass blocks directory directly
+sef chain-info --blocks-dir ~/.bitcoin/signet/blocks
+```
+
+**Advantages:**
+- No external dependencies
+- Faster for simple statistics
+- Works with non-standard block files
+
+<Note>
+  For production use, the `kernel` feature is recommended to ensure only validated blocks are encoded.
+</Note>
+
+## Performance
+
+Typical execution time:
+- **Small chains (&lt;10k blocks):** &lt;1 second
+- **Medium chains (10k–100k blocks):** 1–5 seconds
+- **Large chains (&gt;500k blocks):** 5–30 seconds
+
+The command only reads block headers and metadata, not full block data, so it's much faster than full encoding.
+
+## Troubleshooting
+
+### "No blocks found" Error
+
+**Cause:** The specified directory doesn't contain valid Bitcoin block files.
+
+**Solution:** Check the path and ensure it points to:
+- `~/.bitcoin/signet/blocks` (with `kernel` feature)
+- Directory containing `blk*.dat` files (without `kernel` feature)
+
+### "Permission denied" Error
+
+**Cause:** Insufficient permissions to read the blocks directory.
+
+**Solution:** Ensure the user has read permissions on the directory and files.
+
+### Wrong Chain Tip
+
+**Cause:** Bitcoin Core is still syncing or the datadir is corrupted.
+
+**Solution:** Wait for Bitcoin Core to finish syncing and run `bitcoin-cli getblockchaininfo` to verify the tip.
+
+## Example Workflow
+
+Complete workflow from chain inspection to encoding:
+
+```bash
+# 1. Check chain statistics
+sef chain-info --blocks-dir ~/.bitcoin/signet/blocks
+# Note: 25847 blocks, avg 1751 bytes
+
+# 2. Choose parameters based on stats
+# k=100 (reasonable epoch size)
+# symbol_size=4096 (2-4x average)
+
+# 3. Test reconstruction first
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --k 100 --symbol-size 4096
+# Verify 100% recovery rate
+
+# 4. Generate persistent droplets
+sef generate --blocks-dir ~/.bitcoin/signet/blocks --k 100 --symbol-size 4096
+```
+
+## See Also
+
+- [`sef generate`](/cli/generate) — Generate droplets from blocks
+- [`sef dist-info`](/cli/dist-info) — View distribution statistics for parameters
+- [`sef reconstruct`](/cli/reconstruct) — Test encoding/decoding with current chain data

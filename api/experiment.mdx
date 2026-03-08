@@ -1,0 +1,463 @@
+---
+title: 'experiment'
+description: 'Simulation infrastructure for evaluating fountain code storage reduction in distributed networks'
+---
+
+## Overview
+
+The `experiment` module provides simulation infrastructure for evaluating fountain code storage reduction in a distributed network model. It models a network of $n = 100$ nodes, each storing a random subset of $s$ droplets drawn from a pre-generated pool.
+
+The core question: **Given $K$ contacted nodes, can the union of their droplets reconstruct all $k$ source blocks via the peeling decoder?**
+
+## Experiment Modes
+
+Two experiment modes are provided:
+
+1. **`run_experiment`** — Multi-node storage reduction simulation. Sweeps over `(s, K)` configurations to measure reconstruction success rate.
+2. **`sweep_total_droplets`** — Pure decoding threshold analysis. Ignores the node model and directly varies the number of distinct droplets $M$.
+
+## Functions
+
+### run_experiment
+
+Runs the full storage reduction experiment across all `(s, K)` configurations.
+
+<CodeGroup>
+```rust Function Signature
+pub fn run_experiment(
+    config: &ExperimentConfig
+) -> Vec<ConfigResult>
+```
+
+```rust Example
+use sef::experiment::{ExperimentConfig, run_experiment};
+
+let config = ExperimentConfig {
+    k: 100,
+    c: 0.1,
+    delta: 0.05,
+    pool_size: 500,
+    trials: 500,
+    s_values: vec![5, 10, 20, 50],
+    k_nodes_values: (1..=20).collect(),
+};
+
+let results = run_experiment(&config);
+
+for r in &results {
+    println!("s={} K={} success={:.1}% reduction={:.1}x",
+        r.s, r.k_nodes, r.success_rate * 100.0, r.reduction_factor);
+}
+```
+</CodeGroup>
+
+<ParamField path="config" type="&ExperimentConfig" required>
+  Configuration struct controlling all simulation parameters
+</ParamField>
+
+<ResponseField name="Result" type="Vec<ConfigResult>">
+  Returns one `ConfigResult` per `(s, K)` pair, ordered by ascending $s$ then ascending $K$. Each result contains aggregated statistics across all trials
+</ResponseField>
+
+### Simulation Process
+
+For every `(s, K)` pair in the configuration, the simulator executes `trials` independent rounds:
+
+1. **Generate pool**: Create `pool_size` droplet neighbor-index vectors using the Robust Soliton distribution
+2. **Assign to nodes**: Give each of 100 nodes exactly $s$ unique droplets sampled uniformly without replacement
+3. **Contact nodes**: Select $K$ nodes at random and union their droplets
+4. **Decode**: Run the peeling decoder on the union and record success/failure
+
+---
+
+### sweep_total_droplets
+
+Sweeps over total distinct droplet counts $M$ to locate the decoding threshold.
+
+<CodeGroup>
+```rust Function Signature
+pub fn sweep_total_droplets(
+    k: usize,
+    c: f64,
+    delta: f64,
+    m_values: &[usize],
+    pool_size: usize,
+    trials: usize
+) -> Vec<(usize, f64, f64)>
+```
+
+```rust Example
+use sef::experiment::sweep_total_droplets;
+
+let results = sweep_total_droplets(
+    50,              // k: source blocks
+    0.1,             // c: Robust Soliton parameter
+    0.05,            // delta: failure probability
+    &[60, 80, 100, 120, 150],  // M values to sweep
+    500,             // pool_size
+    100              // trials per M value
+);
+
+for (m, success_rate, mean_decoded) in &results {
+    println!("M={} success={:.1}% avg_decoded={:.1}",
+        m, success_rate * 100.0, mean_decoded);
+}
+```
+</CodeGroup>
+
+<ParamField path="k" type="usize" required>
+  Number of source blocks (symbols) in the epoch
+</ParamField>
+
+<ParamField path="c" type="f64" required>
+  Robust Soliton parameter $c$ that scales the spike biasing the distribution toward degree-1 droplets
+</ParamField>
+
+<ParamField path="delta" type="f64" required>
+  Robust Soliton failure-probability bound $\delta$. Smaller values produce heavier spike mass
+</ParamField>
+
+<ParamField path="m_values" type="&[usize]" required>
+  List of distinct droplet counts to sweep. For each value, the function draws $M$ droplets and attempts decoding
+</ParamField>
+
+<ParamField path="pool_size" type="usize" required>
+  Size of the pre-generated droplet pool from which samples are drawn
+</ParamField>
+
+<ParamField path="trials" type="usize" required>
+  Number of independent trials per $M$ value to compute success rate
+</ParamField>
+
+<ResponseField name="Result" type="Vec<(usize, f64, f64)>">
+  Returns a vector of tuples where:
+  - First element: $M$ (number of distinct droplets)
+  - Second element: success rate (fraction of trials where all $k$ blocks were recovered)
+  - Third element: mean decoded (average number of source blocks decoded per trial)
+</ResponseField>
+
+### Purpose
+
+This function isolates the pure fountain code overhead from network-topology effects by ignoring the distributed node model entirely. It helps answer: **What is the minimum number of droplets needed to reconstruct $k$ source blocks?**
+
+---
+
+### generate_droplet_indices
+
+Generates the neighbor (source block) indices for a droplet without computing XOR payloads.
+
+<CodeGroup>
+```rust Function Signature
+pub fn generate_droplet_indices<D: DegreeDistribution>(
+    dist: &D,
+    k: usize,
+    epoch_seed: &[u8; 32],
+    epoch_id: u64,
+    droplet_id: u64
+) -> Vec<u32>
+```
+
+```rust Example
+use sef::distribution::RobustSoliton;
+use sef::experiment::generate_droplet_indices;
+
+let dist = RobustSoliton::new(100, 0.1, 0.05);
+let seed = [0u8; 32];
+let indices = generate_droplet_indices(&dist, 100, &seed, 0, 42);
+
+assert!(!indices.is_empty());
+assert!(indices.iter().all(|&i| (i as usize) < 100));
+```
+</CodeGroup>
+
+<ParamField path="dist" type="&D: DegreeDistribution" required>
+  Degree distribution (typically `RobustSoliton`) used to sample the droplet degree
+</ParamField>
+
+<ParamField path="k" type="usize" required>
+  Number of source blocks in the epoch
+</ParamField>
+
+<ParamField path="epoch_seed" type="&[u8; 32]" required>
+  32-byte seed for deterministic droplet generation
+</ParamField>
+
+<ParamField path="epoch_id" type="u64" required>
+  Epoch identifier used to derive the droplet-specific PRNG seed
+</ParamField>
+
+<ParamField path="droplet_id" type="u64" required>
+  Droplet identifier within the epoch
+</ParamField>
+
+<ResponseField name="Result" type="Vec<u32>">
+  Returns a sorted vector of source block indices that this droplet XORs together. The vector length equals the sampled degree from the distribution
+</ResponseField>
+
+### Deterministic Generation
+
+Uses SHA-256 to derive a deterministic seed from the epoch and droplet metadata, ensuring the graph structure is reproducible across runs and platforms:
+
+```rust
+let hash = Sha256::new()
+    .chain_update(epoch_seed)
+    .chain_update(b"droplet")
+    .chain_update(epoch_id.to_le_bytes())
+    .chain_update(droplet_id.to_le_bytes())
+    .finalize();
+```
+
+This mirrors the PRNG derivation in `EpochParams::droplet_rng` but avoids materializing block payloads, making it suitable for graph-only simulation.
+
+## Configuration Structs
+
+### ExperimentConfig
+
+Configuration for a storage reduction experiment.
+
+```rust
+pub struct ExperimentConfig {
+    pub k: usize,
+    pub c: f64,
+    pub delta: f64,
+    pub pool_size: usize,
+    pub trials: usize,
+    pub s_values: Vec<usize>,
+    pub k_nodes_values: Vec<usize>,
+}
+```
+
+<ParamField path="k" type="usize">
+  Number of source blocks (symbols) in the epoch. Determines the Robust Soliton distribution parameterization
+</ParamField>
+
+<ParamField path="c" type="f64">
+  Robust Soliton parameter $c$ that scales the "spike" biasing the distribution toward degree-1 droplets, aiding peeling decode startup
+</ParamField>
+
+<ParamField path="delta" type="f64">
+  Robust Soliton failure-probability bound $\delta$. Smaller values produce heavier spike mass at the cost of higher average degree
+</ParamField>
+
+<ParamField path="pool_size" type="usize">
+  Size of the pre-generated droplet pool. Should be $\geq 3k$ to ensure sufficient diversity when nodes sample from it
+</ParamField>
+
+<ParamField path="trials" type="usize">
+  Number of independent trials executed per `(s, K)` configuration. Higher values reduce variance in the reported success rate
+</ParamField>
+
+<ParamField path="s_values" type="Vec<usize>">
+  List of "droplets per node" values ($s$) to sweep. Each node stores exactly $s$ droplets drawn uniformly without replacement from the pool
+</ParamField>
+
+<ParamField path="k_nodes_values" type="Vec<usize>">
+  List of "nodes contacted" values ($K$) to sweep. For each $K$, the simulator unions the droplets of $K$ randomly chosen nodes and attempts peeling decode
+</ParamField>
+
+### Default Configuration
+
+```rust
+impl Default for ExperimentConfig {
+    fn default() -> Self {
+        Self {
+            k: 100,
+            c: 0.1,
+            delta: 0.05,
+            pool_size: 500,
+            trials: 500,
+            s_values: vec![5, 10, 20, 50],
+            k_nodes_values: (1..=20).collect(),
+        }
+    }
+}
+```
+
+## Result Structs
+
+### ConfigResult
+
+Aggregated statistics for one `(s, K)` configuration across all trials.
+
+```rust
+pub struct ConfigResult {
+    pub s: usize,
+    pub k_nodes: usize,
+    pub reduction_factor: f64,
+    pub trials: usize,
+    pub successes: usize,
+    pub success_rate: f64,
+    pub mean_distinct_droplets: f64,
+    pub mean_decoded: f64,
+}
+```
+
+<ResponseField name="s" type="usize">
+  Droplets stored per node ($s$)
+</ResponseField>
+
+<ResponseField name="k_nodes" type="usize">
+  Number of nodes contacted ($K$)
+</ResponseField>
+
+<ResponseField name="reduction_factor" type="f64">
+  Theoretical storage reduction factor: $k / s$. Higher values indicate more efficient storage
+</ResponseField>
+
+<ResponseField name="trials" type="usize">
+  Total number of trials executed for this configuration
+</ResponseField>
+
+<ResponseField name="successes" type="usize">
+  Number of trials where all $k$ source blocks were successfully recovered
+</ResponseField>
+
+<ResponseField name="success_rate" type="f64">
+  Fraction of trials that achieved full recovery (`successes / trials`). Range: [0.0, 1.0]
+</ResponseField>
+
+<ResponseField name="mean_distinct_droplets" type="f64">
+  Mean number of distinct droplets collected across trials. Helps understand droplet overlap between nodes
+</ResponseField>
+
+<ResponseField name="mean_decoded" type="f64">
+  Mean number of source blocks decoded per trial. For successful trials this equals $k$; partial failures contribute lower values
+</ResponseField>
+
+### TrialResult
+
+Outcome of a single simulation trial for one `(s, K)` pair.
+
+```rust
+pub struct TrialResult {
+    pub s: usize,
+    pub k_nodes: usize,
+    pub distinct_droplets: usize,
+    pub peel: PeelResult,
+}
+```
+
+<ResponseField name="s" type="usize">
+  Number of droplets stored per node ($s$)
+</ResponseField>
+
+<ResponseField name="k_nodes" type="usize">
+  Number of nodes contacted ($K$) in this trial
+</ResponseField>
+
+<ResponseField name="distinct_droplets" type="usize">
+  Number of distinct droplets in the union of the $K$ contacted nodes for this specific trial
+</ResponseField>
+
+<ResponseField name="peel" type="PeelResult">
+  Result of running the peeling decoder on the collected droplets. Contains fields like `success: bool` and `decoded: usize`
+</ResponseField>
+
+## Simulation Parameters
+
+### Network Model
+
+- **Node count**: Fixed at $n = 100$ nodes
+- **Topology**: Flat network (no hierarchy or clustering)
+- **Storage**: Each node stores exactly $s$ droplets
+- **Sampling**: Droplets assigned uniformly without replacement from pool
+- **Contact pattern**: Uniform random selection of $K$ nodes per trial
+
+### Fountain Code Parameters
+
+- **Distribution**: Robust Soliton with parameters $(k, c, \delta)$
+- **Degree sampling**: Deterministic PRNG derived from SHA-256 hash
+- **Index selection**: Uniform without replacement using `rand::seq::index::sample`
+- **Decoder**: Peeling algorithm (see `crate::decoder::peeling_check`)
+
+### Reproducibility
+
+- **Deterministic RNG**: All randomness derives from fixed seeds
+- **Platform-independent**: Uses ChaCha8 PRNG and SHA-256 (no platform-specific RNG)
+- **Replicable**: Same `(config, seed)` produces identical results across machines
+
+```rust
+// Node assignments use deterministic seed
+let mut master_rng = ChaCha8Rng::seed_from_u64(42);
+
+// Trial sampling uses config-dependent seed
+let mut trial_rng = ChaCha8Rng::seed_from_u64(
+    (s as u64) * 1_000 + (k_nodes as u64)
+);
+```
+
+## Performance Characteristics
+
+### run_experiment
+
+**Time Complexity**: $O(|S| \cdot |K| \cdot T \cdot (P + K \cdot s + D))$
+
+Where:
+- $|S|$ = length of `s_values`
+- $|K|$ = length of `k_nodes_values`  
+- $T$ = `trials`
+- $P$ = `pool_size` (pool generation)
+- $K$ = nodes contacted
+- $s$ = droplets per node
+- $D$ = decoding complexity (typically $O(k^2)$ worst case)
+
+**Space**: $O(P \cdot d + n \cdot s)$ where $d$ is average droplet degree
+
+### sweep_total_droplets
+
+**Time Complexity**: $O(|M| \cdot T \cdot (P + D))$
+
+Where:
+- $|M|$ = length of `m_values`
+- $T$ = `trials`
+- $P$ = `pool_size`
+- $D$ = decoding complexity
+
+**Space**: $O(P \cdot d + M \cdot d)$
+
+## Use Cases
+
+### Storage Reduction Analysis
+
+```rust
+let config = ExperimentConfig {
+    k: 500,
+    s_values: vec![50, 100, 150],  // 10x, 5x, 3.3x reduction
+    k_nodes_values: (5..=30).collect(),
+    trials: 1000,
+    ..Default::default()
+};
+
+let results = run_experiment(&config);
+
+// Find minimum K for 99% success at each s
+for s in &config.s_values {
+    let min_k = results.iter()
+        .filter(|r| r.s == *s && r.success_rate >= 0.99)
+        .map(|r| r.k_nodes)
+        .min();
+    println!("s={s}: min K for 99% success = {min_k:?}");
+}
+```
+
+### Decoding Threshold
+
+```rust
+let m_values: Vec<usize> = (100..=200).step_by(10).collect();
+let results = sweep_total_droplets(100, 0.1, 0.05, &m_values, 500, 1000);
+
+// Find threshold where success rate crosses 50%
+let threshold = results.iter()
+    .find(|(_, rate, _)| *rate >= 0.5)
+    .map(|(m, _, _)| m);
+
+println!("Decoding threshold: {threshold:?} droplets for k=100");
+```
+
+## Dependencies
+
+- **`crate::decoder`**: Provides `peeling_check` and `PeelResult`
+- **`crate::distribution`**: Provides `RobustSoliton` and `DegreeDistribution` trait
+- **`rand`**: PRNG and sampling functions
+- **`rand_chacha`**: ChaCha8 PRNG for deterministic randomness
+- **`sha2`**: SHA-256 for droplet seed derivation

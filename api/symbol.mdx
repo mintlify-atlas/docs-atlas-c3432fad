@@ -1,0 +1,279 @@
+---
+title: "symbol"
+description: "Normalize variable-length blockchain data into uniform fixed-size symbols for fountain encoding"
+---
+
+Without normalization, the RSD-based encoder must pad every XOR operation to the length of the largest block in the epoch, wasting bandwidth proportional to the variance in block sizes. This module concatenates all blocks into a single contiguous byte stream, then slices that stream into fixed-size chunks of [`DEFAULT_SYMBOL_SIZE`](#constants) bytes. Only the final symbol may contain zero-padding.
+
+Concatenation reduces the effective $K$ for the fountain code—many small blocks pack into fewer symbols—improving both RSD efficiency and decoding probability. The [`SymbolManifest`](#symbolmanifest) tracks the mapping from symbols back to original blocks, enabling reassembly after decoding.
+
+**Dependency graph position:** downstream of raw block ingestion (`crate::chain`), upstream of `crate::droplet::Encoder`.
+
+## Example
+
+```rust
+use sef::symbol::{blocks_to_symbols, symbols_to_blocks, DEFAULT_SYMBOL_SIZE};
+
+let blocks = vec![vec![0xAAu8; 300], vec![0xBBu8; 500]];
+let (symbols, manifest) = blocks_to_symbols(&blocks, DEFAULT_SYMBOL_SIZE);
+
+// Simulate a full decode: all symbols recovered.
+let decoded: Vec<Option<Vec<u8>>> = symbols.into_iter().map(Some).collect();
+let recovered = symbols_to_blocks(&decoded, &manifest);
+
+assert_eq!(recovered[0].as_ref().unwrap(), &blocks[0]);
+assert_eq!(recovered[1].as_ref().unwrap(), &blocks[1]);
+```
+
+---
+
+## Constants
+
+<ParamField path="DEFAULT_SYMBOL_SIZE" type="usize">
+  ```rust
+  pub const DEFAULT_SYMBOL_SIZE: usize = 4096;
+  ```
+
+  Default symbol size in bytes (4 KiB).
+
+  Aligns with typical filesystem page size and provides a reasonable trade-off between symbol count (lower $K$ → better RSD efficiency) and padding overhead on the final symbol.
+</ParamField>
+
+---
+
+## blocks_to_symbols
+
+```rust
+pub fn blocks_to_symbols(
+    blocks: &[Vec<u8>],
+    symbol_size: usize,
+) -> (Vec<Vec<u8>>, SymbolManifest)
+```
+
+Concatenates `blocks` into a single byte stream, then slices into fixed-size symbols.
+
+Unlike a per-block splitting strategy (where each block is independently padded to `symbol_size`), concatenation packs data tightly: block boundaries may fall mid-symbol, and only the final symbol carries zero-padding. This reduces the total symbol count—and therefore the effective $K$—yielding better RSD efficiency and decoding probability.
+
+Returns `(symbols, manifest)` where every symbol is exactly `symbol_size` bytes and [`SymbolManifest`](#symbolmanifest) records the mapping back to original blocks.
+
+### Parameters
+
+<ParamField path="blocks" type="&[Vec<u8>]" required>
+  Variable-length blocks to concatenate and slice.
+</ParamField>
+
+<ParamField path="symbol_size" type="usize" required>
+  Fixed size in bytes for each symbol. Must be positive.
+</ParamField>
+
+### Returns
+
+<ResponseField name="symbols" type="Vec<Vec<u8>>">
+  Fixed-size symbols, each exactly `symbol_size` bytes. The final symbol is zero-padded if needed.
+</ResponseField>
+
+<ResponseField name="manifest" type="SymbolManifest">
+  Metadata sidecar mapping symbols back to original blocks. Required for decoding.
+</ResponseField>
+
+### Panics
+
+Panics if `symbol_size == 0`.
+
+### Example
+
+```rust
+use sef::symbol::blocks_to_symbols;
+
+let blocks = vec![
+    vec![0xAA; 300],
+    vec![0xBB; 500],
+    vec![0xCC; 1],
+];
+let (symbols, manifest) = blocks_to_symbols(&blocks, 4096);
+
+// All 3 blocks fit in 1 symbol (300 + 500 + 1 = 801 bytes)
+assert_eq!(symbols.len(), 1);
+assert_eq!(symbols[0].len(), 4096);
+assert_eq!(manifest.total_symbols, 1);
+```
+
+---
+
+## symbols_to_blocks
+
+```rust
+pub fn symbols_to_blocks(
+    symbols: &[Option<Vec<u8>>],
+    manifest: &SymbolManifest,
+) -> Vec<Option<Vec<u8>>>
+```
+
+Reconstructs original blocks from decoded symbols using the [`SymbolManifest`](#symbolmanifest).
+
+For each [`BlockEntry`](#blockentry) in the manifest, the function identifies the symbol range that covers `[byte_offset, byte_offset + true_len)` in the concatenated stream. If every symbol in that range is `Some`, the block bytes are extracted and returned. Otherwise, the entry yields `None`, enabling partial-recovery semantics: callers can determine exactly which original blocks were successfully decoded.
+
+### Parameters
+
+<ParamField path="symbols" type="&[Option<Vec<u8>>]" required>
+  Decoded symbols from the fountain decoder. `None` entries represent missing symbols.
+</ParamField>
+
+<ParamField path="manifest" type="&SymbolManifest" required>
+  Manifest produced by [`blocks_to_symbols`](#blocks_to_symbols).
+</ParamField>
+
+### Returns
+
+<ResponseField name="blocks" type="Vec<Option<Vec<u8>>>">
+  Reconstructed blocks. Each entry is `Some(block)` if all required symbols were present, or `None` if any symbol was missing.
+</ResponseField>
+
+### Example
+
+```rust
+use sef::symbol::{blocks_to_symbols, symbols_to_blocks};
+
+let blocks = vec![vec![0xAA; 3000], vec![0xBB; 3000]];
+let (symbols, manifest) = blocks_to_symbols(&blocks, 4096);
+// 6000 bytes → 2 symbols
+
+// Simulate partial decode: first symbol recovered, second missing
+let mut partial: Vec<Option<Vec<u8>>> = symbols.into_iter().map(Some).collect();
+partial[1] = None;
+
+let recovered = symbols_to_blocks(&partial, &manifest);
+// Block 0 fits entirely in symbol 0 → recoverable
+assert!(recovered[0].is_some());
+// Block 1 spans symbols 0 and 1 → not recoverable
+assert!(recovered[1].is_none());
+```
+
+---
+
+## SymbolManifest
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct SymbolManifest {
+    pub symbol_size: usize,
+    pub total_symbols: usize,
+    pub block_entries: Vec<BlockEntry>,
+    pub symbol_hashes: Vec<[u8; 32]>,
+}
+```
+
+Metadata sidecar that maps decoded symbols back to original blocks.
+
+After the fountain decoder recovers individual symbols, this manifest provides the byte-level mapping needed to reassemble the original variable-length blocks from the concatenated symbol stream. It must be distributed alongside the encoded droplets (or stored out-of-band) so that any decoder can reconstruct the original data.
+
+Implements `Encodable` / `Decodable` for consensus-compatible serialization, making it suitable for on-chain or P2P transport.
+
+### Fields
+
+<ParamField path="symbol_size" type="usize" required>
+  Symbol size in bytes. Every symbol—including the final one—is exactly this length (the tail is zero-padded).
+</ParamField>
+
+<ParamField path="total_symbols" type="usize" required>
+  Total number of symbols produced by [`blocks_to_symbols`](#blocks_to_symbols).
+</ParamField>
+
+<ParamField path="block_entries" type="Vec<BlockEntry>" required>
+  Per-block metadata recording each block's position and true length within the concatenated byte stream. See [`BlockEntry`](#blockentry).
+</ParamField>
+
+<ParamField path="symbol_hashes" type="Vec<[u8; 32]>" required>
+  SHA-256 hash of each symbol, used for integrity verification during peeling decode.
+</ParamField>
+
+### Serialization
+
+The manifest can be serialized using Bitcoin consensus encoding:
+
+```rust
+use sef::symbol::{serialize_manifest, deserialize_manifest};
+
+let bytes = serialize_manifest(&manifest);
+let recovered = deserialize_manifest(&bytes)?;
+assert_eq!(manifest, recovered);
+```
+
+---
+
+## BlockEntry
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockEntry {
+    pub byte_offset: usize,
+    pub true_len: usize,
+}
+```
+
+Manifest entry describing a single original block's position in the concatenated stream.
+
+Used by [`symbols_to_blocks`](#symbols_to_blocks) to extract the correct byte range from the reassembled symbol stream.
+
+### Fields
+
+<ParamField path="byte_offset" type="usize" required>
+  Byte offset of this block relative to the *concatenated* byte stream (not relative to any individual block or symbol boundary).
+</ParamField>
+
+<ParamField path="true_len" type="usize" required>
+  True serialized byte length of the block before zero-padding.
+</ParamField>
+
+---
+
+## Serialization Functions
+
+### serialize_manifest
+
+```rust
+pub fn serialize_manifest(manifest: &SymbolManifest) -> Vec<u8>
+```
+
+Serializes a [`SymbolManifest`](#symbolmanifest) to bytes using Bitcoin consensus encoding.
+
+<ParamField path="manifest" type="&SymbolManifest" required>
+  Manifest to serialize.
+</ParamField>
+
+**Returns:** Consensus-encoded byte vector.
+
+### deserialize_manifest
+
+```rust
+pub fn deserialize_manifest(data: &[u8]) -> Result<SymbolManifest, encode::Error>
+```
+
+Deserializes a [`SymbolManifest`](#symbolmanifest) from bytes produced by [`serialize_manifest`](#serialize_manifest).
+
+<ParamField path="data" type="&[u8]" required>
+  Consensus-encoded manifest bytes.
+</ParamField>
+
+**Returns:** `Result<SymbolManifest, encode::Error>`
+
+---
+
+## Design Rationale
+
+### Why concatenate instead of per-block padding?
+
+Consider encoding 100 blocks of 300 bytes each with a 4 KiB symbol size:
+
+- **Per-block padding:** Each block becomes one 4 KiB symbol → 100 symbols, 373 KiB wasted padding.
+- **Concatenation:** 30,000 bytes → 8 symbols (7×4096 + 1×1904) → only 2,192 bytes wasted.
+
+Concatenation reduces $K$ from 100 to 8, dramatically improving RSD efficiency and decoding probability while minimizing storage overhead.
+
+### Why fixed-size symbols?
+
+The Robust Soliton Distribution assumes uniform source-block sizes. Variable-length blocks would require padding every XOR operation to the maximum block size, negating bandwidth savings. Fixed-size symbols enable efficient XOR without per-operation padding.
+
+### Why SHA-256 hashes in the manifest?
+
+Symbol hashes enable integrity verification during peeling decode: after recovering a symbol via XOR operations, the decoder can confirm the result matches the expected hash before using it to peel further symbols. This prevents error propagation in the bipartite graph.

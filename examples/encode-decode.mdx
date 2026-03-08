@@ -1,0 +1,304 @@
+---
+title: "Encode-Decode Round Trip"
+description: "Complete example of encoding source blocks into fountain-coded droplets and decoding them back to the original data"
+---
+
+## Overview
+
+This example demonstrates a complete encode-decode round trip using the SeF library. You'll learn how to:
+
+- Create source blocks for encoding
+- Configure epoch parameters and the Robust Soliton Distribution
+- Generate fountain-coded droplets
+- Decode droplets back to recover the original blocks
+
+## Basic Round Trip
+
+<Steps>
+  <Step title="Import Required Types">
+    Start by importing the core types from the SeF library:
+
+    ```rust
+    use sef::distribution::RobustSoliton;
+    use sef::droplet::{Encoder, EpochParams};
+    use sef::decoder::{peeling_decode, BlockVerifier, VerifyError};
+    ```
+  </Step>
+
+  <Step title="Create Source Blocks">
+    Generate synthetic source blocks to encode. In production, these would be Bitcoin blocks or other data:
+
+    ```rust
+    let k = 50; // Number of source blocks in the epoch
+    let blocks: Vec<Vec<u8>> = (0..k)
+        .map(|i| {
+            let size = 100 + (i % 50) * 10; // Variable-size blocks
+            let mut block = vec![0u8; size];
+            // Fill with a recognizable pattern
+            for (j, byte) in block.iter_mut().enumerate() {
+                *byte = ((i * 31 + j * 17) & 0xFF) as u8;
+            }
+            block
+        })
+        .collect();
+    ```
+
+    <Note>
+      SeF handles variable-size blocks automatically through adaptive zero-padding during XOR operations.
+    </Note>
+  </Step>
+
+  <Step title="Configure Epoch Parameters">
+    Set up the epoch parameters that define the encoding context:
+
+    ```rust
+    let epoch_id = 0;
+    let epoch_seed = [42u8; 32]; // Deterministic seed for reproducibility
+    let params = EpochParams::new(epoch_id, k as u32, epoch_seed);
+    ```
+
+    The `epoch_seed` ensures that any peer with the same parameters can independently verify the encoding graph structure.
+  </Step>
+
+  <Step title="Create Robust Soliton Distribution">
+    Configure the degree distribution for sampling:
+
+    ```rust
+    let c = 0.1;     // Tuning constant (smaller = less overhead)
+    let delta = 0.05; // Failure bound probability
+    let dist = RobustSoliton::new(k, c, delta);
+    ```
+
+    <Tip>
+      The expected degree is typically around 8-12 for k=50. You can check with `dist.expected_degree()`.
+    </Tip>
+  </Step>
+
+  <Step title="Generate Droplets">
+    Create the encoder and generate fountain-coded droplets:
+
+    ```rust
+    let encoder = Encoder::new(&params, &dist, &blocks);
+    
+    // Generate enough droplets for reliable decoding (typically 3-5x overhead)
+    let n_droplets = (k as u64) * 3;
+    let droplets = encoder.generate_n(n_droplets);
+    
+    // Verify droplet structure
+    for droplet in &droplets {
+        assert!(droplet.validate(k as u32).is_ok());
+    }
+    ```
+
+    Each droplet is generated deterministically from its `droplet_id`, so the same ID always produces the same droplet.
+  </Step>
+
+  <Step title="Implement a Block Verifier">
+    Create a verifier to validate recovered blocks during decoding:
+
+    ```rust
+    struct ExactVerifier {
+        expected: Vec<Vec<u8>>,
+    }
+    
+    impl BlockVerifier for ExactVerifier {
+        fn verify_and_len(
+            &self,
+            block_idx: u32,
+            candidate: &[u8],
+        ) -> Result<usize, VerifyError> {
+            let expected = &self.expected[block_idx as usize];
+            
+            // Verify the block content matches
+            if candidate.len() < expected.len() {
+                return Err(VerifyError::Deserialize("too short".into()));
+            }
+            
+            if &candidate[..expected.len()] != expected.as_slice() {
+                return Err(VerifyError::HashMismatch {
+                    block_idx,
+                    expected: format!("block_{}", block_idx),
+                    got: "mismatch".into(),
+                });
+            }
+            
+            // Return the true length (before padding)
+            Ok(expected.len())
+        }
+    }
+    ```
+  </Step>
+
+  <Step title="Decode the Droplets">
+    Use the peeling decoder to recover all source blocks:
+
+    ```rust
+    let verifier = ExactVerifier {
+        expected: blocks.clone(),
+    };
+    
+    let result = peeling_decode(k, droplets, &verifier);
+    
+    // Check decode success
+    assert!(result.is_success());
+    assert_eq!(result.decoded_count, k);
+    assert_eq!(result.verify_failures, 0);
+    
+    // Verify all blocks were recovered correctly
+    for (i, block_opt) in result.blocks.iter().enumerate() {
+        let recovered = block_opt.as_ref().unwrap();
+        assert_eq!(recovered, &blocks[i]);
+    }
+    ```
+  </Step>
+</Steps>
+
+## Graph-Only Peeling Check
+
+For quick verification without payload XOR operations, use `peeling_check`:
+
+```rust
+use sef::decoder::peeling_check;
+
+// Extract just the indices from droplets
+let indices: Vec<Vec<u32>> = droplets.iter()
+    .map(|d| d.indices.clone())
+    .collect();
+
+// Simulate the peeling decoder on the graph structure
+let result = peeling_check(k, &indices);
+
+if result.success {
+    println!("Decoded {}/{} blocks in {} iterations",
+             result.decoded, result.total, result.iterations);
+} else {
+    eprintln!("Decoding stalled at {}/{} blocks",
+              result.decoded, result.total);
+}
+```
+
+<Note>
+  `peeling_check` is much faster than `peeling_decode` since it only validates graph structure without XORing payloads. It's ideal for simulations and overhead analysis.
+</Note>
+
+## Handling Decoding Failures
+
+When decoding stalls (insufficient droplets), inspect the failure details:
+
+```rust
+use sef::decoder::DecodeStopReason;
+
+let result = peeling_decode(k, droplets, &verifier);
+
+if !result.is_success() {
+    match result.stop_reason {
+        DecodeStopReason::Stalled => {
+            eprintln!("Decoding stalled: {}/{} blocks recovered",
+                     result.decoded_count, result.k);
+            
+            // Inspect which blocks failed
+            for failure in &result.failures {
+                eprintln!("Block {} unreachable (referenced by {} droplets)",
+                         failure.index, failure.referenced_by);
+            }
+        }
+        DecodeStopReason::Completed => {
+            println!("All blocks decoded successfully!");
+        }
+    }
+}
+```
+
+## Working with Variable-Size Blocks
+
+<CodeGroup>
+
+```rust Variable Sizes
+let blocks = vec![
+    vec![0xAA, 0xBB],              // 2 bytes
+    vec![0xCC, 0xDD, 0xEE, 0xFF],  // 4 bytes
+];
+
+let params = EpochParams::new(0, 2, [0u8; 32]);
+let dist = RobustSoliton::new(2, 0.1, 0.5);
+let encoder = Encoder::new(&params, &dist, &blocks);
+
+let droplets = encoder.generate_n(10);
+
+// Each droplet's payload is padded to the length of its longest block
+for droplet in &droplets {
+    println!("Droplet {} degree={} padded_len={}",
+             droplet.droplet_id,
+             droplet.degree(),
+             droplet.padded_len);
+}
+```
+
+```rust Uniform Sizes
+let blocks: Vec<Vec<u8>> = (0..20)
+    .map(|i| vec![i as u8; 256]) // All blocks exactly 256 bytes
+    .collect();
+
+let params = EpochParams::new(0, 20, [0u8; 32]);
+let dist = RobustSoliton::new(20, 0.1, 0.5);
+let encoder = Encoder::new(&params, &dist, &blocks);
+
+let droplets = encoder.generate_n(100);
+
+// All droplets will have padded_len=256
+```
+
+</CodeGroup>
+
+## Deterministic Generation
+
+Droplets are generated deterministically, allowing independent regeneration:
+
+```rust
+let encoder = Encoder::new(&params, &dist, &blocks);
+
+// Generate the same droplet twice
+let droplet_a = encoder.generate(42);
+let droplet_b = encoder.generate(42);
+
+// They are identical
+assert_eq!(droplet_a.indices, droplet_b.indices);
+assert_eq!(droplet_a.payload, droplet_b.payload);
+assert_eq!(droplet_a.padded_len, droplet_b.padded_len);
+
+// Different IDs produce different droplets
+let droplet_c = encoder.generate(43);
+assert_ne!(droplet_a.indices, droplet_c.indices);
+```
+
+<Tip>
+  This determinism is crucial for the SeF architecture: any peer with the same epoch parameters can regenerate and verify droplets without network transmission.
+</Tip>
+
+## Performance Considerations
+
+<Tabs>
+  <Tab title="Memory">
+    - **Encoding**: O(k) memory to hold source blocks
+    - **Decoding**: O(k + n) memory for k source blocks and n droplets
+    - Use streaming approaches for large datasets (see Bitcoin integration)
+  </Tab>
+  
+  <Tab title="Overhead">
+    - Typical overhead: 1.5-2x for k=100, 1.2-1.5x for k=1000
+    - Smaller c values reduce overhead but increase failure probability
+    - Delta parameter controls failure bound: tighter bounds need more droplets
+  </Tab>
+  
+  <Tab title="Validation">
+    - Always validate droplets with `droplet.validate(k)` before decoding
+    - Invalid droplets are silently disabled during peeling
+    - Track `result.verify_failures` to detect adversarial droplets
+  </Tab>
+</Tabs>
+
+## Next Steps
+
+- Learn how to [integrate with Bitcoin blocks](/examples/bitcoin-integration)
+- Explore [custom degree distributions](/examples/custom-distribution)
+- See the [API reference](/api/droplet) for detailed documentation

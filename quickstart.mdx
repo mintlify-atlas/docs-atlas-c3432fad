@@ -1,80 +1,358 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quick Start
+description: A complete guide to encoding and decoding blocks with SeF
 ---
 
-## Get started in three steps
+# Quick Start
 
-Get your documentation site running locally and make your first customization.
+This guide walks you through a complete encode-decode round-trip using SeF's fountain code implementation.
 
-### Step 1: Set up your local environment
+## Complete Example
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
+Here's a working example that demonstrates the core SeF workflow:
 
-### Step 2: Deploy your changes
+```rust
+use sef::distribution::RobustSoliton;
+use sef::droplet::{Encoder, EpochParams};
+use sef::decoder::peeling_check;
 
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+fn main() {
+    let k = 50;
+    let blocks: Vec<Vec<u8>> = (0..k)
+        .map(|i| vec![(i & 0xFF) as u8; 256])
+        .collect();
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+    let params = EpochParams::new(0, k as u32, [0u8; 32]);
+    let dist = RobustSoliton::new(k, 0.1, 0.05);
+    let encoder = Encoder::new(&params, &dist, &blocks);
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+    // Generate 3x overhead droplets
+    let droplets = encoder.generate_n((k as u64) * 3);
 
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
-
-## Next steps
-
-Now that you have your docs running, explore these key features:
-
-<CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
-</CardGroup>
+    // Verify recoverability via the peeling check
+    let indices: Vec<Vec<u32>> = droplets.iter().map(|d| d.indices.clone()).collect();
+    let result = peeling_check(k, &indices);
+    assert!(result.success);
+}
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  This example uses synthetic data for demonstration. In production, you would encode real blockchain blocks.
 </Note>
+
+## Step-by-Step Walkthrough
+
+Let's break down the encoding and decoding process:
+
+### Step 1: Create Source Blocks
+
+First, prepare your source blocks. Each block is represented as a `Vec<u8>`:
+
+```rust
+let k = 50;  // Number of source blocks
+let blocks: Vec<Vec<u8>> = (0..k)
+    .map(|i| vec![(i & 0xFF) as u8; 256])
+    .collect();
+```
+
+<Steps>
+  <Step title="Define epoch size">
+    Choose `k` (the number of blocks per epoch). Typical values range from 100-10000 for production use.
+  </Step>
+  
+  <Step title="Prepare block data">
+    Each block is a byte vector. SeF handles variable-length blocks automatically with adaptive zero-padding.
+  </Step>
+</Steps>
+
+### Step 2: Configure Epoch Parameters
+
+Create `EpochParams` to define the encoding context:
+
+```rust
+let params = EpochParams::new(
+    0,              // epoch_id: unique identifier for this epoch
+    k as u32,       // k: number of source blocks
+    [0u8; 32]       // epoch_seed: 32-byte seed for deterministic encoding
+);
+```
+
+<Note>
+  The `epoch_seed` ensures that the encoding graph structure is reproducible by any peer with the same parameters. Use a deterministic seed derived from blockchain data (e.g., block headers).
+</Note>
+
+### Step 3: Initialize the Robust Soliton Distribution
+
+Create the degree distribution used to sample how many blocks each droplet combines:
+
+```rust
+let dist = RobustSoliton::new(
+    k,      // k: number of source blocks
+    0.1,    // c: tuning constant (0.1 is typical)
+    0.05    // delta: failure probability bound (5%)
+);
+```
+
+**Parameter Guidance:**
+
+| Parameter | Typical | Effect |
+|-----------|---------|--------|
+| `c` | 0.1 | Smaller values reduce overhead but increase failure risk |
+| `delta` | 0.05 | Lower values require more droplets but improve success rate |
+
+### Step 4: Create the Encoder
+
+Instantiate an encoder with your parameters:
+
+```rust
+let encoder = Encoder::new(&params, &dist, &blocks);
+```
+
+<Warning>
+  The encoder borrows all inputs (zero-copy). Ensure `params`, `dist`, and `blocks` live as long as the encoder.
+</Warning>
+
+### Step 5: Generate Droplets
+
+Generate fountain-coded droplets. Each droplet is a XOR combination of one or more source blocks:
+
+```rust
+// Generate 3x overhead (150 droplets for 50 blocks)
+let n = (k as u64) * 3;
+let droplets = encoder.generate_n(n);
+```
+
+<Note>
+  **Overhead multiplier:** 3x is conservative and ensures high decoding success. In production, tune this based on your `c` and `delta` parameters.
+</Note>
+
+**Understanding Droplets:**
+
+Each droplet contains:
+- `epoch_id`: Links the droplet to its source epoch
+- `droplet_id`: Unique identifier within the epoch
+- `indices`: Sorted indices of source blocks that were XOR'd
+- `padded_len`: Length of the longest selected block
+- `payload`: The XOR-combined block data
+
+### Step 6: Verify Recoverability (Graph Check)
+
+Before attempting full decoding, verify that the droplet set is theoretically sufficient:
+
+```rust
+let indices: Vec<Vec<u32>> = droplets.iter()
+    .map(|d| d.indices.clone())
+    .collect();
+let result = peeling_check(k, &indices);
+
+assert!(result.success);
+println!("Decoded {}/{} blocks in {} iterations", 
+    result.decoded, result.total, result.iterations);
+```
+
+<Note>
+  `peeling_check` is a lightweight graph-only simulation that verifies recoverability without processing payloads. It's useful for testing parameter configurations.
+</Note>
+
+### Step 7: Full Payload Decoding with Verification
+
+For production use, decode the full payloads with integrated block verification:
+
+```rust
+use sef::decoder::{peeling_decode, BlockVerifier, VerifyError};
+
+// Example: Accept-all verifier (for testing)
+struct AcceptAll;
+impl BlockVerifier for AcceptAll {
+    fn verify_and_len(&self, _idx: u32, c: &[u8]) -> Result<usize, VerifyError> {
+        Ok(c.len())
+    }
+}
+
+let verifier = AcceptAll;
+let result = peeling_decode(k, droplets, &verifier);
+
+if result.is_success() {
+    println!("Successfully decoded all {} blocks!", result.k);
+    
+    // Access recovered blocks
+    for (i, block) in result.blocks.iter().enumerate() {
+        if let Some(data) = block {
+            println!("Block {}: {} bytes", i, data.len());
+        }
+    }
+} else {
+    eprintln!("Decoding failed: {:?}", result.stop_reason);
+    eprintln!("Decoded {}/{} blocks", result.decoded_count, result.k);
+    eprintln!("Verification failures: {}", result.verify_failures);
+}
+```
+
+<Steps>
+  <Step title="Implement BlockVerifier">
+    Create a verifier that checks block integrity (e.g., hash verification for Bitcoin blocks).
+  </Step>
+  
+  <Step title="Run peeling_decode">
+    The decoder iteratively resolves singleton droplets, verifies each recovered block, and XORs it out of connected droplets.
+  </Step>
+  
+  <Step title="Check results">
+    Inspect `result.is_success()` and handle failures gracefully.
+  </Step>
+</Steps>
+
+## Bitcoin Block Verification
+
+For real Bitcoin blocks, use `BitcoinBlockVerifier` with pre-computed block hashes:
+
+```rust
+use sef::decoder::BitcoinBlockVerifier;
+use bitcoin::BlockHash;
+
+// Expected block hashes from the header chain
+let expected_hashes: Vec<BlockHash> = vec![
+    // ... populate with actual block hashes from headers
+];
+
+let verifier = BitcoinBlockVerifier { expected_hashes };
+let result = peeling_decode(k, droplets, &verifier);
+```
+
+<Warning>
+  The `expected_hashes` must be ordered by source block index within the epoch. Misalignment will cause verification failures.
+</Warning>
+
+## CLI Usage
+
+SeF provides a CLI for common operations:
+
+<CodeGroup>
+```bash Generate droplets
+sef generate --blocks-dir ~/.bitcoin/signet/blocks \
+    --output droplets/ \
+    --k 100 \
+    --symbol-size 4096
+```
+
+```bash Decode droplets
+sef decode --input droplets/ \
+    --output decoded/
+```
+
+```bash Decode single epoch
+sef decode --input droplets/ \
+    --output decoded/ \
+    --epoch 42
+```
+
+```bash Round-trip test
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks \
+    --k 100
+```
+
+```bash Storage experiment
+sef experiment --k 100 --trials 500
+```
+</CodeGroup>
+
+### CLI Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `dist-info` | Show Robust Soliton Distribution statistics |
+| `chain-info` | Display chain info from a Bitcoin data directory |
+| `generate` | Generate fountain-coded droplets from blockchain data |
+| `decode` | Decode droplets back into blocks |
+| `reconstruct` | End-to-end encode → decode → verify round-trip |
+| `experiment` | Run storage reduction simulations |
+
+## Common Parameters
+
+<Note>
+  Tuning these parameters allows you to balance storage reduction against decoding reliability.
+</Note>
+
+### Robust Soliton Distribution
+
+```rust
+RobustSoliton::new(k, c, delta)
+```
+
+- **`k`**: Epoch size (100-10000)
+- **`c`**: Tuning constant (0.1 typical)
+  - Smaller → lower overhead, higher risk
+  - Larger → more overhead, safer decoding
+- **`delta`**: Failure probability (0.05 = 5%)
+  - Smaller → more reliable, needs more droplets
+  - Larger → fewer droplets, higher failure risk
+
+### Epoch Parameters
+
+```rust
+EpochParams::new(epoch_id, k, epoch_seed)
+```
+
+- **`epoch_id`**: Unique identifier (e.g., file number)
+- **`k`**: Number of source blocks
+- **`epoch_seed`**: 32-byte deterministic seed
+
+### Droplet Generation
+
+```rust
+encoder.generate_n(n)
+```
+
+- **`n`**: Number of droplets to generate
+  - Minimum: `k` (no redundancy)
+  - Typical: `k * 2` to `k * 5` for reliable decoding
+  - Higher multipliers improve success rate
+
+## Troubleshooting
+
+### Decoding Fails (Stalled)
+
+**Cause:** Insufficient droplets or poor distribution parameters.
+
+**Solution:**
+- Increase the overhead multiplier (generate more droplets)
+- Increase `c` or decrease `delta` in `RobustSoliton`
+- Check `result.failures` to identify uncovered blocks
+
+### Verification Failures
+
+**Cause:** Corrupted droplets or incorrect expected hashes.
+
+**Solution:**
+- Check `result.verify_failures` for Byzantine fault count
+- Ensure `expected_hashes` are correctly ordered
+- Validate droplet integrity with `droplet.validate(k)`
+
+### Panics on Encoder Creation
+
+**Cause:** Mismatch between `blocks.len()` and `params.k`.
+
+**Solution:**
+```rust
+assert_eq!(blocks.len(), params.k as usize);
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="API Reference" icon="code" href="/api/droplet">
+    Explore detailed API documentation for all modules.
+  </Card>
+  
+  <Card title="CLI Reference" icon="terminal" href="/cli/overview">
+    Learn about all available CLI commands and options.
+  </Card>
+  
+  <Card title="Bitcoin Integration" icon="bitcoin" href="/examples/bitcoin-integration">
+    Integrate SeF with Bitcoin Core using the kernel feature.
+  </Card>
+  
+  <Card title="Parameter Tuning" icon="sliders" href="/advanced/performance">
+    Learn how to optimize SeF parameters for your use case.
+  </Card>
+</CardGroup>

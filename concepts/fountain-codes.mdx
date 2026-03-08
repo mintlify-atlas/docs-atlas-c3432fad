@@ -1,0 +1,216 @@
+---
+title: "Fountain Codes"
+description: "Introduction to Luby Transform (LT) fountain codes and how they enable rateless erasure coding"
+---
+
+Fountain codes are **rateless erasure codes** that can generate an unlimited stream of encoded packets from a fixed set of source data. The SeF library implements **Luby Transform (LT) codes**, the first practical fountain code construction.
+
+## What Are LT Codes?
+
+LT codes were invented by Michael Luby in 2002. They enable a sender to generate an endless fountain of encoded packets such that:
+
+- Any subset of **k + ε** packets is sufficient to recover all k source blocks
+- The receiver doesn't need to specify which packets to send
+- Packet loss is handled automatically without retransmission
+
+<Info>
+The overhead ε depends on the degree distribution. The Robust Soliton Distribution achieves ε = O(√k · ln²(k/δ)) with high probability.
+</Info>
+
+## Core Concepts
+
+### Source Blocks
+
+The original data is partitioned into **k** source blocks. In SeF, these are typically blockchain blocks from a single epoch.
+
+```rust
+let k = 50;
+let blocks: Vec<Vec<u8>> = (0..k)
+    .map(|i| vec![(i & 0xFF) as u8; 256])
+    .collect();
+```
+
+### Droplets (Encoded Packets)
+
+A **droplet** is formed by:
+1. Sampling a **degree** d from the Robust Soliton Distribution
+2. Randomly selecting d source block indices
+3. XORing the selected blocks together
+
+```rust
+pub struct Droplet {
+    pub epoch_id: u64,
+    pub droplet_id: u64,
+    pub indices: Vec<u32>,      // Which blocks were XOR'd
+    pub padded_len: u32,         // Longest block length
+    pub payload: Vec<u8>,        // XOR result
+}
+```
+
+<Note>
+Each droplet is generated deterministically from the droplet_id and epoch_seed, so any peer can independently verify the encoding graph structure.
+</Note>
+
+## How Encoding Works
+
+The encoder generates droplets using a deterministic PRNG seeded with domain-separated SHA-256 hashing:
+
+<Steps>
+  <Step title="Derive droplet-specific seed">
+    ```rust
+    fn droplet_rng(&self, droplet_id: u64) -> ChaCha8Rng {
+        let hash = Sha256::new()
+            .chain_update(self.epoch_seed)
+            .chain_update(b"droplet")
+            .chain_update(self.epoch_id.to_le_bytes())
+            .chain_update(droplet_id.to_le_bytes())
+            .finalize();
+
+        ChaCha8Rng::from_seed(hash.into())
+    }
+    ```
+    Source: `src/droplet.rs:114`
+  </Step>
+
+  <Step title="Sample degree from distribution">
+    ```rust
+    let degree = self.dist.sample_degree(&mut rng);
+    ```
+    The degree determines how many blocks to combine.
+  </Step>
+
+  <Step title="Select unique indices">
+    ```rust
+    let mut indices: Vec<u32> = sample(&mut rng, k, degree)
+        .into_iter()
+        .map(|i| i as u32)
+        .collect();
+    indices.sort_unstable();
+    ```
+    Uses Floyd's algorithm to sample without replacement.
+    
+    Source: `src/droplet.rs:197`
+  </Step>
+
+  <Step title="XOR selected blocks">
+    ```rust
+    let selected_blocks: Vec<&[u8]> = indices
+        .iter()
+        .map(|&i| self.blocks[i as usize].as_slice())
+        .collect();
+
+    let payload = xor::xor_blocks(&selected_blocks);
+    ```
+    Shorter blocks are implicitly zero-padded to the maximum length.
+    
+    Source: `src/droplet.rs:204`
+  </Step>
+</Steps>
+
+## Degree Sampling
+
+The **degree distribution** controls how many source blocks each droplet combines. This is the critical parameter that determines decoding efficiency.
+
+### Why Not Uniform Random?
+
+If we sampled degrees uniformly from [1, k], the decoder would frequently stall because there wouldn't be enough degree-1 (singleton) droplets to start the peeling process.
+
+<Warning>
+A naive uniform distribution requires O(k log k) droplets to decode with high probability, versus O(k) for the Robust Soliton Distribution.
+</Warning>
+
+### Degree Distribution Trait
+
+```rust
+pub trait DegreeDistribution {
+    /// Sample a degree d satisfying 1 ≤ d ≤ k
+    fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize;
+
+    /// Expected value E[D] of the distribution
+    fn expected_degree(&self) -> f64;
+}
+```
+Source: `src/distribution.rs:41`
+
+## Example: Generating Droplets
+
+```rust
+use sef::distribution::RobustSoliton;
+use sef::droplet::{Encoder, EpochParams};
+
+let k = 100;
+let blocks: Vec<Vec<u8>> = (0..k).map(|i| vec![i as u8; 64]).collect();
+
+// Configure epoch parameters
+let params = EpochParams::new(0, k as u32, [0u8; 32]);
+let rsd = RobustSoliton::new(k, 0.1, 0.05);
+
+// Create encoder
+let encoder = Encoder::new(&params, &rsd, &blocks);
+
+// Generate droplets
+let droplet = encoder.generate(0);
+assert!(droplet.validate(k as u32).is_ok());
+
+println!("Degree: {}", droplet.degree());
+println!("Indices: {:?}", droplet.indices);
+println!("Payload size: {} bytes", droplet.payload.len());
+```
+
+## Singleton Droplets
+
+Droplets with degree 1 are called **singletons**. They contain a single source block without XORing.
+
+```rust
+pub fn is_singleton(&self) -> bool {
+    self.indices.len() == 1
+}
+```
+Source: `src/droplet.rs:239`
+
+Singletons are critical for starting the decoding process — they provide the initial "seeds" for the peeling decoder's ripple.
+
+<Accordion title="Why can't we just send all singletons?">
+Sending k singleton droplets would perfectly encode the data, but:
+
+1. It wastes bandwidth: any lost packet requires retransmission
+2. It provides no redundancy against erasures
+3. It defeats the purpose of fountain codes
+
+The Robust Soliton Distribution balances singletons (to keep the ripple alive) with higher-degree droplets (for coverage and redundancy).
+</Accordion>
+
+## Rateless Property
+
+Unlike traditional erasure codes (e.g., Reed-Solomon) that produce a fixed number of parity symbols, fountain codes are **rateless**: you can generate arbitrarily many droplets.
+
+```rust
+// Generate 3x overhead droplets
+let droplets = encoder.generate_n((k as u64) * 3);
+
+// Need more? Generate additional droplets
+let more_droplets: Vec<_> = (k*3..k*5)
+    .map(|id| encoder.generate(id))
+    .collect();
+```
+
+<Info>
+Each droplet has a unique droplet_id. Since the encoding is deterministic, different nodes can generate the same droplet by using the same ID.
+</Info>
+
+## Adaptive Padding
+
+When XORing blocks of different lengths, shorter blocks are implicitly zero-padded:
+
+```rust
+let padded_len = selected_blocks.iter().map(|b| b.len()).max().unwrap_or(0);
+let payload = xor::xor_blocks(&selected_blocks);
+```
+Source: `src/droplet.rs:209`
+
+The `padded_len` field stores the maximum block length so the decoder can properly handle variable-sized blocks.
+
+## References
+
+- M. Luby, *"LT Codes"*, Proc. 43rd IEEE FOCS, 2002
+- S. Kadhe, J. Chung, and K. Ramchandran, [*"SeF: A Secure Fountain Architecture for Slashing Storage Costs in Blockchains"*](https://arxiv.org/abs/1906.12140), arXiv:1906.12140, 2019

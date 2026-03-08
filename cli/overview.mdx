@@ -1,0 +1,152 @@
+---
+title: CLI Overview
+description: Installation, basic usage, and global options for the SeF command-line tool
+---
+
+## Overview
+
+The `sef` command-line tool provides a complete implementation of the Secure Fountain (SeF) architecture for blockchain pruning using Luby Transform (LT) fountain codes.
+
+## Installation
+
+### Build from Source
+
+```bash
+# Build with bitcoinkernel support (default)
+cargo build --release
+
+# Build without bitcoinkernel (uses raw blk*.dat parsing)
+cargo build --release --no-default-features
+```
+
+The compiled binary will be available at `target/release/sef`.
+
+## Basic Usage
+
+```bash
+sef <COMMAND> [OPTIONS]
+```
+
+## Available Commands
+
+| Command | Description |
+|---------|-------------|
+| [`generate`](/cli/generate) | Generate fountain-coded droplets from blockchain data |
+| [`decode`](/cli/decode) | Decode droplets back into source blocks |
+| [`reconstruct`](/cli/reconstruct) | End-to-end encode → decode → verify round-trip |
+| [`chain-info`](/cli/chain-info) | Display blockchain statistics |
+| [`dist-info`](/cli/dist-info) | Show Robust Soliton Distribution statistics |
+| [`experiment`](/cli/experiment) | Run storage reduction experiments |
+
+## Quick Start Examples
+
+<CodeGroup>
+
+```bash Show chain info
+sef chain-info --blocks-dir ~/.bitcoin/signet/blocks
+```
+
+```bash Generate droplets
+sef generate --blocks-dir ~/.bitcoin/signet/blocks \
+  --output droplets/ \
+  --k 100 \
+  --symbol-size 4096
+```
+
+```bash Decode droplets
+sef decode --input droplets/ --output decoded/
+```
+
+```bash Test reconstruction
+sef reconstruct --blocks-dir ~/.bitcoin/signet/blocks --k 100
+```
+
+</CodeGroup>
+
+## Key Concepts
+
+### Epochs
+
+The blockchain is partitioned into **epochs** of `k` blocks. Each epoch is independently fountain-encoded to produce droplets.
+
+### Droplets
+
+Droplets are encoded blocks created by XORing source blocks according to degrees sampled from the Robust Soliton Distribution. Each droplet contains:
+- A list of source block indices
+- The XORed payload
+- Metadata for reconstruction
+
+### Symbols
+
+When `--symbol-size` is set, blocks are concatenated and split into fixed-size symbols before encoding. This provides better XOR uniformity for variable-sized blocks.
+
+## Common Parameters
+
+<ParamField path="k" type="integer" default="100">
+  Epoch size — the number of source blocks per epoch. Larger values increase compression potential but require more droplets for recovery.
+</ParamField>
+
+<ParamField path="c" type="float" default="0.1">
+  Robust Soliton tuning constant. Controls the degree-1 spike in the distribution. Typical range: 0.01–0.5.
+</ParamField>
+
+<ParamField path="delta" type="float" default="0.05">
+  Target decoding failure probability. Lower values increase overhead but improve reliability.
+</ParamField>
+
+<ParamField path="symbol-size" type="integer" default="4096">
+  Fixed symbol size in bytes for block concatenation. Set to 0 to disable symbol normalization and encode blocks directly.
+</ParamField>
+
+<ParamField path="buffer" type="integer" default="10">
+  Number of recent blocks to exclude from encoding (confirmation window). These blocks are kept in raw form.
+</ParamField>
+
+## Feature Flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `kernel` | **enabled** | Uses `bitcoinkernel` for validated block access from Bitcoin Core datadir. Disable with `--no-default-features` to use raw blk*.dat parsing. |
+
+<Note>
+  When the `kernel` feature is enabled, the `--blocks-dir` parameter should point to the parent directory of the `blocks/` folder (e.g., `~/.bitcoin/signet`).
+</Note>
+
+## Output Formats
+
+### Droplet Files
+
+Generated droplets are stored in a directory structure:
+
+```
+droplets/
+├── epoch_0/
+│   ├── droplet_0.bin
+│   ├── droplet_1.bin
+│   ├── ...
+│   └── manifest.bin
+├── epoch_1/
+│   ├── droplet_0.bin
+│   └── ...
+```
+
+Each `manifest.bin` contains metadata required for decoding, including symbol hashes and block boundaries.
+
+### Decoded Blocks
+
+Decoded blocks are written in Bitcoin's standard `blk*.dat` format:
+
+```
+decoded/
+├── blk00000.dat
+├── blk00001.dat
+└── ...
+```
+
+Each file contains the network magic bytes, block size, and raw block data.
+
+## Next Steps
+
+- [Generate Droplets](/cli/generate) — Encode blockchain data
+- [Decode Droplets](/cli/decode) — Recover original blocks
+- [Reconstruct Command](/cli/reconstruct) — Test end-to-end encoding and decoding

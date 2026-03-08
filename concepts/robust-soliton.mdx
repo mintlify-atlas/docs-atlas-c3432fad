@@ -1,0 +1,281 @@
+---
+title: "Robust Soliton Distribution"
+description: "Deep dive into the RSD formula, parameters, and the spike mechanism that enables efficient LT decoding"
+---
+
+The **Robust Soliton Distribution (RSD)** is the degree distribution that makes Luby Transform codes practical. It augments the Ideal Soliton Distribution with a carefully tuned "spike" to maintain the decoder's **ripple** — the set of degree-1 packets available at each peeling step.
+
+## Why Not Ideal Soliton?
+
+The **Ideal Soliton Distribution** has probability mass:
+
+$$
+\rho(d) = \begin{cases}
+1/k & d = 1 \\
+1/(d(d-1)) & 2 \le d \le k
+\end{cases}
+$$
+
+<Warning>
+While theoretically optimal, the Ideal Soliton fails in practice because the ripple collapses to zero with high probability before all source symbols are recovered.
+</Warning>
+
+The RSD adds redundancy to prevent ripple collapse.
+
+## RSD Formula
+
+The Robust Soliton Distribution is defined as:
+
+$$
+\mu(d) = \frac{\rho(d) + \tau(d)}{\beta}
+$$
+
+where β is the normalization constant:
+
+$$
+\beta = \sum_{d=1}^{k} (\rho(d) + \tau(d))
+$$
+
+### The Spike Function τ(d)
+
+The spike function τ(d) adds extra probability mass around degree R = k/S:
+
+$$
+\tau(d) = \begin{cases}
+S/(dk) & 1 \le d < R \\
+S \ln(S/\delta) / k & d = R \\
+0 & d > R
+\end{cases}
+$$
+
+where:
+- **S** = c√k ln(k/δ) is the spike parameter
+- **R** = ⌊k/S⌋ is the spike location
+
+<Info>
+The spike ensures that there are always approximately S degree-1 packets available in the ripple during decoding.
+</Info>
+
+## Parameters
+
+### k: Epoch Size
+
+The number of source blocks in the epoch. This determines the entire probability mass function.
+
+```rust
+pub struct RobustSoliton {
+    k: usize,
+    c: f64,
+    delta: f64,
+    cdf: Vec<f64>,
+}
+```
+Source: `src/distribution.rs:63`
+
+### c: Tuning Constant
+
+**Typical value:** 0.1
+
+Scales the spike magnitude S = c√k ln(k/δ). Affects the tradeoff between overhead and reliability:
+
+- **Smaller c** → Lower overhead, thinner ripple, higher failure risk
+- **Larger c** → Higher overhead, wider ripple, lower failure risk
+
+```rust
+pub c: f64,  // Free parameter that scales spike magnitude
+```
+Source: `src/distribution.rs:68`
+
+### δ: Failure Probability Bound
+
+**Typical value:** 0.05 (5%)
+
+Upper bound on decoding failure probability after receiving k(1 + ε) encoded symbols.
+
+```rust
+pub delta: f64,  // Upper bound on decoding-failure probability
+```
+Source: `src/distribution.rs:75`
+
+Tighter bounds (smaller δ) widen the spike and increase expected degree.
+
+## Implementation
+
+<Steps>
+  <Step title="Compute spike parameters">
+    ```rust
+    let k_f = k as f64;
+    let s = c * (k_f / delta).ln() * k_f.sqrt();
+    let r_boundary = (k_f / s).round() as usize;
+    ```
+    Source: `src/distribution.rs:142`
+  </Step>
+
+  <Step title="Build unnormalized PMF">
+    ```rust
+    let mut pmf = vec![0.0f64; k + 1];
+    for d in 1..=k {
+        let rho = if d == 1 {
+            1.0 / k_f
+        } else {
+            1.0 / (d as f64 * (d as f64 - 1.0))
+        };
+        let tau = if r_boundary == 0 {
+            0.0
+        } else if d < r_boundary {
+            s / (d as f64 * k_f)
+        } else if d == r_boundary {
+            (s / k_f) * (s / delta).ln()
+        } else {
+            0.0
+        };
+
+        pmf[d] = rho + tau;
+        sum_rho_plus_tau += pmf[d];
+    }
+    ```
+    Source: `src/distribution.rs:150`
+  </Step>
+
+  <Step title="Normalize and build CDF">
+    ```rust
+    let mut running_sum = 0.0;
+    for d in 1..=k {
+        running_sum += pmf[d] / sum_rho_plus_tau;
+        cdf[d] = running_sum;
+    }
+    cdf[k] = 1.0;  // Ensures perfect closure
+    ```
+    Source: `src/distribution.rs:172`
+  </Step>
+</Steps>
+
+## Sampling Degrees
+
+The RSD uses inverse transform sampling with binary search for O(log k) degree queries:
+
+```rust
+fn sample_degree<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
+    let u: f64 = rng.gen();
+
+    let idx = self.cdf[1..]
+        .binary_search_by(|v| v.partial_cmp(&u).expect("NaN in CDF"))
+        .unwrap_or_else(|e| e);
+
+    (idx + 1).clamp(1, self.k)
+}
+```
+Source: `src/distribution.rs:186`
+
+<Accordion title="Why binary search?">
+The CDF is pre-computed once during initialization. Sampling involves:
+
+1. Generate uniform random u ∈ [0, 1)
+2. Find the smallest d where CDF[d] ≥ u
+3. Return d
+
+Binary search makes this O(log k) instead of O(k) for linear scan.
+</Accordion>
+
+## Expected Degree
+
+The expected degree E[D] is computed by differencing consecutive CDF entries:
+
+```rust
+fn expected_degree(&self) -> f64 {
+    self.cdf[..=self.k]
+        .windows(2)
+        .enumerate()
+        .map(|(i, window)| {
+            let d = (i + 1) as f64;
+            let p = window[1] - window[0];
+            d * p
+        })
+        .sum()
+}
+```
+Source: `src/distribution.rs:201`
+
+<Info>
+For typical parameters (k=1000, c=0.1, δ=0.05), the expected degree is around 8-12, much lower than k/2 for uniform sampling.
+</Info>
+
+## Creating an RSD Instance
+
+```rust
+use sef::distribution::RobustSoliton;
+
+let k = 1000;
+let c = 0.1;
+let delta = 0.05;
+
+let rsd = RobustSoliton::new(k, c, delta);
+
+println!("Expected degree: {:.2}", rsd.expected_degree());
+println!("Spike location R: {}", (k as f64 / (c * (k as f64 / delta).ln() * (k as f64).sqrt())).round());
+```
+
+## Rebuilding for Different Epoch Sizes
+
+The CDF depends on k, so a single RSD instance must be rebuilt when switching epochs:
+
+```rust
+let mut rsd = RobustSoliton::new(100, 0.1, 0.05);
+
+// Later, for a different epoch size
+rsd.rebuild(200);
+assert_eq!(rsd.k(), 200);
+```
+Source: `src/distribution.rs:123`
+
+<Note>
+Rebuilding is O(k). If you encode many epochs of varying sizes, consider maintaining a cache of RSD instances indexed by k.
+</Note>
+
+## Spike Mechanism Intuition
+
+The spike serves two purposes:
+
+1. **Maintain ripple size:** Ensures approximately S singletons are always available during decoding
+2. **Accelerate coverage:** Droplets near degree R = k/S cover O(k/S) blocks each, quickly increasing coverage in early peeling steps
+
+Without the spike, the decoder would stall when the ripple becomes empty before all blocks are recovered.
+
+## Parameter Selection Guidelines
+
+| Use Case | k | c | δ | Overhead |
+|----------|---|---|---|----------|
+| Low reliability | 50-100 | 0.05 | 0.1 | ~2x |
+| Standard | 100-1000 | 0.1 | 0.05 | ~3x |
+| High reliability | 1000+ | 0.2 | 0.01 | ~5x |
+
+<Warning>
+Very small values of c (< 0.05) or large values of δ (> 0.1) can cause frequent decoding failures. Always validate with simulations before deploying.
+</Warning>
+
+## Validation Tests
+
+The library includes tests to ensure CDF validity:
+
+```rust
+#[test]
+fn test_cdf_is_valid() {
+    let k = 1000;
+    let dist = RobustSoliton::new(k, 0.1, 0.05);
+    assert!(dist.cdf[0] == 0.0 && dist.cdf[k] == 1.0);
+
+    for d in 1..=k {
+        assert!(
+            dist.cdf[d] >= dist.cdf[d - 1],
+            "CDF not monotone at d={}",
+            d
+        );
+    }
+}
+```
+Source: `src/distribution.rs:244`
+
+## References
+
+- M. Luby, *"LT Codes"*, Proc. 43rd IEEE FOCS, 2002
+- Section III.B of [SeF paper](https://arxiv.org/abs/1906.12140) for tuning heuristics
